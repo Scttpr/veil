@@ -1,0 +1,891 @@
+
+API REFERENCE
+-------------
+
+VeilClient.init(userId, serverUrl, authToken?)
+
+    Static async constructor. Creates a new VeilClient instance.
+
+    Parameters:
+        userId      string    A unique identifier for this user.
+        serverUrl   string    Base URL for the server.
+                              Example: "/veil" or "https://api.example.com"
+        authToken   string?   Optional Bearer token included in all HTTP
+                              requests. The server should validate that only
+                              the key owner can update their keys.
+
+    Returns:        Promise<VeilClient>
+
+    Behavior:
+        - Loads or generates an X25519 + Ed25519 key pair.
+        - Encrypts the secret keys with a non-extractable WebCrypto key
+          (stored in IndexedDB) before persisting to localStorage.
+          Falls back to plaintext if IndexedDB is unavailable.
+        - Uploads both public keys to the server via PUT /veil/keys/:userId.
+        - Legacy keys (DH-only, plaintext) are automatically migrated to
+          the encrypted dual-key format on load.
+
+    Errors:
+        - localStorage is not available or access is denied.
+        - The PUT request to the server fails.
+        - A previously encrypted key cannot be decrypted (IndexedDB cleared
+          but localStorage was not). Use importIdentity() to recover.
+
+--------
+
+client.publicKey()
+
+    Returns the user's X25519 public key as a base64 string.
+
+    Parameters:     (none)
+    Returns:        string (44 characters, base64)
+
+--------
+
+client.signingKey()
+
+    Returns the user's Ed25519 signing public key as a base64 string.
+
+    Parameters:     (none)
+    Returns:        string (44 characters, base64)
+
+--------
+
+client.userId()
+
+    Returns the user ID this client was initialized with.
+
+    Parameters:     (none)
+    Returns:        string
+
+--------
+
+client.isNewIdentity()
+
+    Whether this client has a freshly generated identity key. If true, the
+    app should prompt the user to call exportIdentity() to create a backup.
+
+    Parameters:     (none)
+    Returns:        boolean
+
+--------
+
+client.wasRotated()
+
+    Whether this client was created via key rotation (rotateKey()).
+    Returns false for clients created via init() or importIdentity().
+
+    Parameters:     (none)
+    Returns:        boolean
+
+--------
+
+VeilClient.rotateKey(userId, serverUrl, authToken?)
+
+    Static async constructor. Generates a fresh X25519 + Ed25519 key pair,
+    overwrites local storage, and uploads the new public keys to the server.
+    Returns a new VeilClient; the old instance is stale.
+
+    Recipients must call trustKey(userId) to accept the new keys (TOFU pins
+    will reject the old keys). Use reseal() on existing envelopes to re-wrap
+    with the new identity.
+
+    Parameters:
+        userId      string    The user whose keys to rotate.
+        serverUrl   string    Base URL for the server.
+        authToken   string?   Optional Bearer token.
+
+    Returns:        Promise<VeilClient>
+
+    Behavior:
+        - Generates fresh X25519 + Ed25519 key pairs.
+        - Encrypts and stores the new secret keys (same at-rest protection
+          as init()).
+        - Uploads both new public keys to the server via PUT /veil/keys/:userId.
+        - client.wasRotated() returns true.
+        - client.isNewIdentity() returns false.
+
+    Errors:
+        - localStorage / IndexedDB access fails.
+        - The PUT request to the server fails.
+
+--------
+
+client.exportIdentity(password)
+
+    Exports the identity keys (DH + signing) encrypted with a user-provided
+    password. Returns a base64-encoded blob that can be imported on another
+    device using VeilClient.importIdentity().
+
+    Uses PBKDF2-SHA256 (1,000,000 iterations) + AES-256-GCM.
+    Blob format (v2): version(2) || salt(16) || nonce(12) ||
+    ciphertext(dh_secret[32] || sign_secret[32]) + tag.
+
+    Parameters:
+        password    string    Password to encrypt the export blob.
+                              Must be at least 16 characters.
+
+    Returns:        string    Base64-encoded encrypted blob.
+
+    Errors:
+        - Password is shorter than 16 characters.
+        - Encryption fails (should not happen in practice).
+
+--------
+
+VeilClient.importIdentity(userId, serverUrl, blobB64, password, authToken?)
+
+    Static async constructor. Imports identity keys from an encrypted blob
+    (created by exportIdentity()) and initializes a client.
+
+    Handles both v1 (DH-only, generates a new signing key) and v2
+    (DH + signing) export formats.
+
+    Parameters:
+        userId      string    User ID for this identity.
+        serverUrl   string    Base URL for the server.
+        blobB64     string    Base64-encoded export blob.
+        password    string    Password used when exporting.
+        authToken   string?   Optional Bearer token.
+
+    Returns:        Promise<VeilClient>
+
+    Errors:
+        - Wrong password or corrupted blob.
+        - Server communication fails.
+
+--------
+
+client.trustKey(userId)
+
+    Clears the TOFU (Trust-On-First-Use) key pins (both DH and signing)
+    for a user. Call this when a legitimate key rotation has occurred and
+    you want to accept the user's new public keys.
+
+    This is a sensitive operation. Only call after verifying the key change
+    out-of-band. A console warning is emitted for auditability. Applications
+    should implement their own rate limiting or confirmation UI before
+    allowing trustKey() calls.
+
+    Parameters:
+        userId      string    The user whose pins should be cleared.
+
+    Returns:        void
+
+    Errors:
+        - localStorage access fails.
+
+--------
+
+client.seal(plaintext, recipientIds, metadataJson?)
+
+    Encrypts data and wraps the DEK for each recipient. The envelope is
+    signed with the caller's Ed25519 key.
+
+    Parameters:
+        plaintext       string      The data to encrypt (UTF-8).
+        recipientIds    string[]    User IDs of additional recipients.
+        metadataJson    string?     Optional JSON string of unencrypted
+                                    metadata (e.g. sender, type, timestamp).
+
+    Returns:            Promise<string>    Envelope as a JSON string.
+
+    Behavior:
+        - Generates a random DEK.
+        - Encrypts the plaintext with AES-256-GCM.
+        - Fetches each recipient's public keys from the server.
+        - Wraps the DEK for each recipient and for the caller.
+        - Signs the envelope with the caller's Ed25519 key.
+        - Returns the serialized Envelope.
+
+    Errors:
+        - A recipient's public keys cannot be fetched (404).
+
+--------
+
+client.sealBytes(plaintext, recipientIds, metadataJson?)
+
+    Like seal(), but accepts raw bytes instead of a UTF-8 string.
+
+    Parameters:
+        plaintext       Uint8Array  The data to encrypt.
+        recipientIds    string[]    User IDs of additional recipients.
+        metadataJson    string?     Optional JSON metadata.
+
+    Returns:            Promise<string>    Envelope as a JSON string.
+
+    Errors:
+        - A recipient's public keys cannot be fetched (404).
+
+--------
+
+client.open(envelopeJson)
+
+    Verifies the signature and decrypts an envelope. Fetches the signer's
+    signing key from the server and TOFU-verifies it before decrypting.
+
+    Parameters:
+        envelopeJson    string    The Envelope JSON string.
+
+    Returns:            Promise<string>    The decrypted plaintext.
+
+    Behavior:
+        - Parses the envelope and extracts the signer_id.
+        - Fetches the signer's signing public key from the server.
+        - TOFU-verifies the signing key against the local pin.
+        - Verifies the Ed25519 signature.
+        - Unwraps the DEK using our secret key.
+        - Decrypts the ciphertext.
+
+    Errors:
+        - The envelope is unsigned (no signer_id or signature).
+        - The envelope is a group envelope (use groupOpen()).
+        - The signer's public key cannot be fetched.
+        - The signing key has changed (TOFU mismatch).
+        - Signature verification fails.
+        - We are not a recipient of this envelope.
+        - The envelope is corrupted or tampered with.
+
+--------
+
+client.openUnverified(envelopeJson)
+
+    Decrypts an envelope WITHOUT verifying the signature.
+
+    Use with caution. Intended for scenarios where the caller has already
+    verified the signature or intentionally wants to skip verification
+    (e.g. offline/cached envelopes where the signer's key is unavailable).
+    A console warning is emitted when called.
+
+    Parameters:
+        envelopeJson    string    The Envelope JSON string.
+
+    Returns:            string    The decrypted plaintext.
+
+    Behavior:
+        - Finds the WrappedKey matching our user ID.
+        - Unwraps the DEK using our secret key.
+        - Decrypts the ciphertext.
+
+    Errors:
+        - The envelope is a group envelope (use groupOpen()).
+        - We are not a recipient of this envelope.
+        - The envelope is corrupted or tampered with.
+
+    Note: This is a synchronous operation (no server call needed).
+
+--------
+
+client.openBytes(envelopeJson)
+
+    Like open(), but returns raw bytes instead of a UTF-8 string.
+    Verifies the signature before decrypting.
+
+    Parameters:
+        envelopeJson    string    The Envelope JSON string.
+
+    Returns:            Promise<Uint8Array>    The decrypted bytes.
+
+    Errors:
+        - Same as open().
+
+--------
+
+client.openUnverifiedBytes(envelopeJson)
+
+    Like openUnverified(), but returns raw bytes instead of a UTF-8 string.
+    A console warning is emitted when called.
+
+    Parameters:
+        envelopeJson    string    The Envelope JSON string.
+
+    Returns:            Uint8Array    The decrypted bytes.
+
+    Errors:
+        - Same as openUnverified().
+
+    Note: This is a synchronous operation (no server call needed).
+
+--------
+
+client.verify(envelopeJson)
+
+    Verifies the Ed25519 signature on an envelope. Fetches the signer's
+    public signing key from the server and TOFU-verifies it.
+
+    This is useful when you have already decrypted with openUnverified()
+    and want to verify the signature separately, or when you want to
+    verify without decrypting.
+
+    Parameters:
+        envelopeJson    string    The Envelope JSON string.
+
+    Returns:            Promise<void>    Resolves if valid.
+
+    Behavior:
+        - Parses the envelope and extracts the signer_id.
+        - Fetches the signer's signing public key from the server.
+        - TOFU-verifies the signing key against the local pin.
+        - Verifies the Ed25519 signature over the signed payload.
+
+    Errors:
+        - The envelope is unsigned (no signer_id or signature).
+        - The signer's public key cannot be fetched.
+        - The signing key has changed (TOFU mismatch).
+        - Signature verification fails (tampered envelope).
+
+--------
+
+client.addRecipient(envelopeJson, recipientId)
+
+    Adds a new recipient to an existing envelope.
+
+    Parameters:
+        envelopeJson    string    The Envelope JSON string.
+        recipientId     string    User ID of the new recipient.
+
+    Returns:            Promise<string>    Updated Envelope as JSON.
+
+    Behavior:
+        - Unwraps the DEK (caller must be an existing recipient).
+        - Fetches the new recipient's public keys from the server.
+        - Wraps the DEK for the new recipient.
+        - Returns the envelope with the new recipient appended.
+        - The envelope is re-signed by the caller.
+
+    Errors:
+        - The envelope is a group envelope (use addGroupMember()).
+        - Caller is not a recipient (cannot unwrap DEK).
+        - Recipient already exists in the envelope.
+        - New recipient's public keys cannot be fetched.
+
+--------
+
+client.removeRecipient(envelopeJson, recipientId)
+
+    Removes a recipient from an envelope (soft revocation).
+
+    Parameters:
+        envelopeJson    string    The Envelope JSON string.
+        recipientId     string    User ID to remove.
+
+    Returns:            string    Updated Envelope as JSON.
+
+    Behavior:
+        - Removes the WrappedKey for the specified recipient.
+        - Does NOT re-encrypt the data (soft revocation).
+        - The envelope is re-signed by the caller.
+
+    Errors:
+        - The envelope is a group envelope (use removeGroupMember()).
+        - Recipient not found in the envelope.
+        - Removing would leave the envelope with no recipients.
+
+    Note: This is a synchronous, local operation. For hard revocation
+    (ensuring the removed user can never decrypt), call reseal().
+
+--------
+
+client.reseal(envelopeJson, recipientIds, metadataJson?)
+
+    Re-seals an envelope with a fresh DEK (hard revocation).
+
+    Parameters:
+        envelopeJson    string      The Envelope JSON string.
+        recipientIds    string[]    User IDs of recipients (excluding self).
+        metadataJson    string?     Optional new metadata JSON. If omitted,
+                                    the original metadata is preserved.
+
+    Returns:            Promise<string>    New Envelope as JSON.
+
+    Behavior:
+        - Decrypts the data (caller must be a recipient).
+        - Generates a new DEK and re-encrypts.
+        - Wraps the new DEK for the caller and each recipient.
+        - Signs the new envelope with the caller's Ed25519 key.
+        - Returns a fresh envelope. Old DEKs are useless.
+
+    Errors:
+        - The envelope is a group envelope (use groupSeal()).
+        - Caller is not a recipient of the original envelope.
+        - A recipient's public keys cannot be fetched.
+
+--------
+
+client.createAuditEntry(action, targetId?, timestamp, prevHash?)
+
+    Creates a signed audit log entry. Entries form a hash chain: each
+    entry includes the SHA-256 of the previous entry, making the log
+    append-only and tamper-evident.
+
+    Parameters:
+        action      string    The action performed: "seal", "grant",
+                              "revoke", or "reseal".
+        targetId    string?   The affected user (for grant/revoke).
+                              Pass null for seal/reseal.
+        timestamp   number    Caller-provided Unix milliseconds
+                              (e.g. Date.now()).
+        prevHash    string?   The entry_hash of the previous entry,
+                              or null for the genesis entry.
+
+    Returns:        string    AuditEntry as a JSON string.
+
+    Behavior:
+        - Computes a canonical payload: "veil-audit-v1" || action ||
+          actor_id || target_id || timestamp || prev_hash.
+        - Hashes the payload (SHA-256) to produce entry_hash.
+        - Signs the payload with the caller's Ed25519 key.
+        - The genesis entry uses SHA-256("") as its prev_hash.
+
+    Errors:
+        - prev_hash is not valid base64.
+
+--------
+
+client.anchorAudit(envelopeJson, auditEntryJson)
+
+    Sets the audit_hash field on an envelope to the given entry's
+    entry_hash. This links the envelope to its audit trail.
+
+    Parameters:
+        envelopeJson      string    The Envelope JSON string.
+        auditEntryJson    string    The AuditEntry JSON string.
+
+    Returns:              string    Updated Envelope as JSON.
+
+    Note: This is a local operation. The audit_hash is not covered by
+    the envelope signature, so anchoring does not invalidate it.
+
+    Errors:
+        - Either JSON argument is malformed.
+
+--------
+
+client.verifyAuditLog(envelopeJson, auditEntriesJson)
+
+    Verifies an audit log against an envelope.
+
+    Parameters:
+        envelopeJson        string    The Envelope JSON string.
+        auditEntriesJson    string    JSON array of AuditEntry objects.
+
+    Returns:                Promise<void>    Resolves if valid.
+
+    Behavior:
+        - Fetches each actor's signing key from the server.
+        - Verifies each entry's hash and Ed25519 signature.
+        - Verifies hash-chain linkage (each prev_hash matches the
+          previous entry_hash, genesis uses SHA-256("")).
+        - Verifies that the envelope's audit_hash matches the chain
+          head (the last entry's entry_hash).
+
+    Errors:
+        - An actor's signing key cannot be fetched.
+        - An entry's hash or signature is invalid.
+        - The hash chain is broken.
+        - The envelope's audit_hash does not match the chain head.
+        - The envelope has no audit_hash.
+
+--------
+
+client.createGroup(groupId, memberIds)
+
+    Creates a new group. Generates a Group Encryption Key (GEK), wraps it
+    for each member (including the caller) using ECIES, signs the bundle,
+    and uploads it to the server.
+
+    Parameters:
+        groupId     string      Unique identifier for the group.
+        memberIds   string[]    User IDs of other members (caller is
+                                included automatically).
+
+    Returns:        Promise<string>    GroupKeyBundle as JSON.
+
+    Errors:
+        - A member's public keys cannot be fetched.
+        - The PUT request to the server fails.
+
+--------
+
+client.addGroupMember(groupId, memberId)
+
+    Adds a member to an existing group. Fetches the bundle, unwraps the
+    GEK, wraps for the new member, re-signs, and uploads.
+
+    Parameters:
+        groupId     string    The group to modify.
+        memberId    string    User ID of the new member.
+
+    Returns:        Promise<string>    Updated GroupKeyBundle as JSON.
+
+    Behavior:
+        - Same epoch (no GEK rotation). New member gets the existing GEK.
+        - Bundle is re-signed by the caller.
+
+    Errors:
+        - Caller is not a group member.
+        - Member already exists.
+        - New member's public keys cannot be fetched.
+
+--------
+
+client.removeGroupMember(groupId, memberId)
+
+    Removes a member from a group (rotates the GEK).
+
+    Parameters:
+        groupId     string    The group to modify.
+        memberId    string    User ID of the member to remove.
+
+    Returns:        Promise<string>    Updated GroupKeyBundle as JSON.
+
+    Behavior:
+        - Generates a NEW GEK (epoch incremented by 1).
+        - Wraps the new GEK for remaining members.
+        - The removed member's old GEK cannot decrypt new envelopes.
+        - Fetches public keys for all remaining members.
+        - Bundle is re-signed by the caller.
+
+    Errors:
+        - Member not found in the group.
+        - Removing would leave the group empty.
+        - A remaining member's public keys cannot be fetched.
+
+--------
+
+client.groupSeal(plaintext, groupId, metadataJson?)
+
+    Seals data for a group. Fetches the group bundle, unwraps the GEK,
+    encrypts data with a fresh DEK, wraps the DEK with the GEK.
+
+    Parameters:
+        plaintext       string    The data to encrypt (UTF-8).
+        groupId         string    The group to seal for.
+        metadataJson    string?   Optional JSON metadata.
+
+    Returns:            Promise<string>    Envelope as JSON.
+
+    Behavior:
+        - Generates a random DEK, encrypts plaintext (AES-256-GCM).
+        - Wraps DEK with GEK (AES-256-GCM, AD = "veil-group-dek:" + groupId).
+        - Signs the envelope (group_id included in the signed payload).
+        - Envelope has empty recipients list and group_id/wrapped_dek set.
+
+    Errors:
+        - Caller is not a group member.
+        - Group bundle cannot be fetched.
+
+--------
+
+client.groupOpen(envelopeJson)
+
+    Opens a group-encrypted envelope. Verifies the signature, fetches the
+    group bundle, unwraps the GEK, unwraps the DEK, and decrypts.
+
+    Group envelopes must be signed. Unsigned group envelopes are rejected.
+
+    Parameters:
+        envelopeJson    string    The Envelope JSON string.
+
+    Returns:            Promise<string>    The decrypted plaintext.
+
+    Behavior:
+        - Reads group_id from the envelope.
+        - Extracts the signer_id (required).
+        - Fetches the signer's key and verifies the signature.
+        - Fetches the group's bundle from the server.
+        - Unwraps the GEK using the caller's identity key.
+        - Unwraps the DEK using the GEK.
+        - Decrypts the ciphertext.
+
+    Errors:
+        - Envelope is not a group envelope (no group_id).
+        - Envelope is unsigned (missing signer_id or signature).
+        - Signature verification fails.
+        - Caller is not a group member.
+        - Decryption fails.
+
+--------
+
+client.sealStreamInit(recipientIds, metadataJson?, chunkSize?)
+
+    Initializes a streaming sealer for per-recipient encryption.
+
+    Parameters:
+        recipientIds    string[]    User IDs of recipients.
+        metadataJson    string?     Optional JSON metadata.
+        chunkSize       number?     Chunk size in bytes (default 65536).
+
+    Returns:            Promise<StreamSealer>
+
+    Behavior:
+        - Generates a random DEK and 8-byte nonce prefix.
+        - Fetches each recipient's public keys from the server.
+        - Wraps the DEK for each recipient and for the caller.
+        - Signs the StreamHeader with the caller's Ed25519 key.
+        - Returns a StreamSealer ready to encrypt chunks.
+
+    Errors:
+        - A recipient's public keys cannot be fetched.
+        - Duplicate recipient ID in the list.
+        - Caller (sealer) is also in the recipient list.
+        - chunk_size is zero.
+
+--------
+
+StreamSealer.header()
+
+    Returns the StreamHeader as a JSON string. Send/store this before
+    the encrypted chunks.
+
+    Parameters:     (none)
+    Returns:        string (JSON)
+
+--------
+
+StreamSealer.sealChunk(chunk, isLast)
+
+    Encrypts a chunk of plaintext.
+
+    Parameters:
+        chunk       Uint8Array    The plaintext bytes.
+        isLast      boolean       True for the final chunk.
+
+    Returns:        Uint8Array    Encrypted chunk bytes.
+
+    Errors:
+        - Stream is already finalized.
+        - Chunk index overflow (> 4 billion chunks).
+
+    Note: After calling with isLast=true, the sealer is finalized and
+    no more chunks can be sealed. Call free() to release WASM memory.
+
+--------
+
+client.openStreamInit(headerJson)
+
+    Initializes a streaming opener for per-recipient decryption.
+    Verifies the header signature before unwrapping the DEK.
+
+    Parameters:
+        headerJson    string    StreamHeader as JSON.
+
+    Returns:          Promise<StreamOpener>
+
+    Behavior:
+        - Parses the header and extracts the signer_id (required).
+        - Fetches the signer's signing public key from the server.
+        - TOFU-verifies the signing key against the local pin.
+        - Verifies the Ed25519 signature over the header payload.
+        - Finds the caller's wrapped DEK in the header.
+        - Unwraps the DEK using the caller's secret key.
+        - Returns a StreamOpener ready to decrypt chunks.
+
+    Errors:
+        - Header is unsigned (no signer_id or signature).
+        - The signer's public key cannot be fetched.
+        - The signing key has changed (TOFU mismatch).
+        - Signature verification fails.
+        - Caller is not a recipient.
+        - Invalid header format.
+
+--------
+
+client.openStreamInitUnverified(headerJson)
+
+    Initializes a streaming opener WITHOUT verifying the header signature.
+
+    Use with caution. Intended for scenarios where the caller has already
+    verified the header or intentionally wants to skip verification
+    (e.g. offline/cached streams). A console warning is emitted when called.
+
+    Parameters:
+        headerJson    string    StreamHeader as JSON.
+
+    Returns:          StreamOpener
+
+    Behavior:
+        - Finds the caller's wrapped DEK in the header.
+        - Unwraps the DEK using the caller's secret key.
+        - Returns a StreamOpener ready to decrypt chunks.
+
+    Errors:
+        - Caller is not a recipient.
+        - Invalid header format.
+
+    Note: This is a synchronous operation (no server call needed).
+
+--------
+
+client.verifyStreamHeader(headerJson)
+
+    Verifies the Ed25519 signature on a stream header. Fetches the
+    signer's public signing key from the server and TOFU-verifies it.
+
+    This is useful when you have already opened a stream with
+    openStreamInitUnverified() and want to verify the header separately.
+
+    Parameters:
+        headerJson    string    StreamHeader as JSON.
+
+    Returns:          Promise<void>    Resolves if valid.
+
+    Behavior:
+        - Parses the header and extracts the signer_id.
+        - Fetches the signer's signing public key from the server.
+        - TOFU-verifies the signing key against the local pin.
+        - Verifies the Ed25519 signature over the header payload.
+
+    Errors:
+        - Header is unsigned (no signer_id or signature).
+        - The signer's public key cannot be fetched.
+        - The signing key has changed (TOFU mismatch).
+        - Signature verification fails.
+
+--------
+
+StreamOpener.openChunk(encryptedChunk)
+
+    Decrypts a chunk.
+
+    Parameters:
+        encryptedChunk    Uint8Array    Encrypted chunk bytes.
+
+    Returns:              Uint8Array    Decrypted plaintext bytes.
+
+    Errors:
+        - Stream is already finished.
+        - Chunk too short (< 17 bytes).
+        - Decryption fails (tampered, wrong order, wrong DEK).
+
+--------
+
+StreamOpener.isDone()
+
+    Whether the final chunk has been processed.
+
+    Parameters:     (none)
+    Returns:        boolean
+
+--------
+
+client.groupSealStreamInit(groupId, metadataJson?, chunkSize?)
+
+    Initializes a streaming sealer for group encryption.
+
+    Parameters:
+        groupId         string      The group to seal for.
+        metadataJson    string?     Optional JSON metadata.
+        chunkSize       number?     Chunk size in bytes (default 65536).
+
+    Returns:            Promise<StreamSealer>
+
+    Behavior:
+        - Fetches the group's bundle and unwraps the GEK.
+        - Generates a random DEK and wraps it with the GEK.
+        - Signs the StreamHeader (includes group_id).
+        - Returns a StreamSealer ready to encrypt chunks.
+
+    Errors:
+        - Caller is not a group member.
+        - Group bundle cannot be fetched.
+
+--------
+
+client.groupOpenStreamInit(headerJson)
+
+    Initializes a streaming opener for group decryption. Verifies the
+    header signature before unwrapping.
+
+    Group stream headers must be signed. Unsigned headers are rejected.
+
+    Parameters:
+        headerJson    string    StreamHeader as JSON.
+
+    Returns:          Promise<StreamOpener>
+
+    Behavior:
+        - Extracts the signer_id (required).
+        - Fetches the signer's key and verifies the signature.
+        - Reads group_id from the header.
+        - Fetches the group's bundle and unwraps the GEK.
+        - Unwraps the DEK using the GEK.
+        - Returns a StreamOpener ready to decrypt chunks.
+
+    Errors:
+        - Header is unsigned (missing signer_id or signature).
+        - Signature verification fails.
+        - Header is not a group stream.
+        - Caller is not a group member.
+
+--------
+
+client.autoSeal(plaintext, recipientIds, metadataJson?)
+
+    Seals data using a transparent auto-group. Computes a deterministic
+    group ID from the sorted participant list, creates the group if it
+    doesn't exist, and seals via groupSeal.
+
+    Parameters:
+        plaintext       string      The data to encrypt (UTF-8).
+        recipientIds    string[]    User IDs of recipients.
+        metadataJson    string?     Optional JSON metadata.
+
+    Returns:            Promise<string>    Envelope as JSON.
+
+    Behavior:
+        - Computes auto-group ID: SHA-256("veil-auto-group-v1" +
+          "\n" + sorted unique participant IDs joined by "\n")
+          -> "auto:<base64>".
+        - Checks if the group exists (GET /veil/groups/:groupId).
+        - If not found, creates it (createGroup with all participants).
+        - Seals via groupSeal with the auto-group ID.
+
+    Errors:
+        - A participant's public keys cannot be fetched.
+        - Group creation or sealing fails.
+
+--------
+
+client.autoOpen(envelopeJson)
+
+    Opens an envelope, transparently dispatching between direct and group
+    decryption based on the envelope contents. Both paths verify the
+    signature before decrypting.
+
+    Parameters:
+        envelopeJson    string    The Envelope JSON string.
+
+    Returns:            Promise<string>    The decrypted plaintext.
+
+    Behavior:
+        - Parses the envelope and checks for group_id.
+        - If group_id is present: opens via groupOpen (signature required).
+        - If no group_id: opens via open (signature required).
+
+    Errors:
+        - The envelope is unsigned.
+        - Caller is not a recipient or group member.
+        - Decryption fails.
+
+--------
+
+client.invalidateGroupCache(groupId)
+
+    Invalidates the cached GEK for a group. Call this after external
+    group modifications (e.g. member removal by another user).
+
+    Parameters:
+        groupId     string    The group whose cache entry to clear.
+
+    Returns:        void
+
+--------
+
+client.clearCaches()
+
+    Clears all in-memory caches (key cache and GEK cache). Call this
+    when the client should re-fetch everything from the server.
+
+    Parameters:     (none)
+    Returns:        void

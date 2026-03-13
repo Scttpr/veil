@@ -1,0 +1,410 @@
+
+CRYPTOGRAPHIC DESIGN
+--------------------
+
+All primitives are from the RustCrypto ecosystem and the dalek-cryptography
+project. No custom cryptography, no novel constructions.
+
+    Identity Keys .......... X25519 (key exchange) + Ed25519 (signing)
+    Key Wrapping ........... ECIES (ephemeral X25519 DH + HKDF + AES-GCM)
+    Key Derivation ......... HKDF-SHA256 (context-bound: "veil-wrap" || keys)
+    Symmetric Encryption ... AES-256-GCM (authenticated encryption)
+    Streaming Encryption ... STREAM construction (AES-256-GCM per chunk)
+    Envelope Signing ....... Ed25519 (deterministic signatures)
+    Secret Zeroization ..... zeroize crate (Zeroizing<T> on all secrets)
+    At-Rest Protection ..... WebCrypto non-extractable AES-256-GCM (IndexedDB)
+    Identity Export ........ PBKDF2-SHA256 (1M iterations) + AES-256-GCM
+    Key Distribution ....... Authenticated HTTP + TOFU key pinning (DH + signing)
+    Random Number Gen ...... Browser crypto.getRandomValues (via getrandom)
+    Key Directory .......... In-memory PublicKeyBundle cache + TOFU pinning
+    GEK Caching ............ In-memory (group_id, epoch) -> GEK cache
+
+Each wrap operation uses a fresh ephemeral key pair. Even wrapping the same
+DEK for the same recipient twice produces different ciphertext.
+
+The HKDF info string binds both the ephemeral and recipient public keys:
+"veil-wrap" || ephemeral_public || recipient_public. The associated data
+for key wrapping is the recipient's public key, binding the wrapped DEK to
+its intended recipient and preventing key substitution.
+
+DH outputs are validated via was_contributory() (RFC 7748 section 6) to
+reject low-order points that would produce predictable shared secrets.
+
+Envelope signatures use a deterministic payload format:
+"veil-sig-v1" || version(1) || has_signer(1) ||
+[signer_id_len(4 BE) || signer_id] || ciphertext_len(4 BE) ||
+ciphertext_base64 || has_metadata(1) || [metadata_len(4 BE) ||
+metadata_json] || access_type(1) || access_data.
+For direct envelopes, access_data is the sorted recipient list
+(length-prefixed per-recipient fields). For group envelopes, it is the
+group_id and wrapped_dek. All variable-length fields are length-prefixed
+to prevent boundary ambiguity. The signature covers the full recipient
+list, so adding or removing recipients requires re-signing.
+
+
+POST-QUANTUM READINESS
+
+The current primitives (X25519, Ed25519) are vulnerable to quantum computers
+running Shor's algorithm. Veil does not implement post-quantum algorithms
+today because no mature, audited ML-KEM or ML-DSA implementation exists for
+the WASM target. Taking a dependency on an unaudited PQ crate in a security
+library would undermine the guarantees Veil provides. The architecture is
+designed so that PQ can be added when a production-ready crate is available,
+without breaking the public API.
+
+    Target algorithms (NIST FIPS 203/204, finalized 2024):
+        X25519 (DH)    -> ML-KEM-768   (key exchange)   ~1,184 byte pubkeys
+        Ed25519 (sig)  -> ML-DSA-65    (signatures)     ~1,952 byte pubkeys
+
+    Key size impact:
+        Classical keys:  32 + 32 = 64 bytes per user
+        PQ keys:         1,184 + 1,952 = 3,136 bytes per user (~49x larger)
+
+    Why the architecture already accounts for this:
+
+        PublicKeyBundle is an extensible struct -- adding kem_public and
+        pq_sign_public fields requires no API changes.
+
+        KeyCache exists specifically because PQ public keys will be too
+        large to fetch on every operation. Caching amortizes that cost.
+
+        Group envelopes reduce KEM operations from per-message to
+        per-group. A group with 50 members needs one KEM decapsulation
+        per open, not 50. GekCache avoids even that when the GEK is
+        already cached.
+
+        Auto-groups transparently create group keys for recurring
+        conversations (e.g. DMs), so PQ overhead is paid once per
+        participant set, not once per message.
+
+    Migration plan:
+        1. Add PQ key fields to PublicKeyBundle (hybrid: classical + PQ).
+        2. Replace ECIES wrapping with ML-KEM-768 encapsulation (or combine
+           both shared secrets via HKDF for a hybrid scheme).
+        3. Replace Ed25519 signatures with ML-DSA-65.
+        4. Classical keys remain during transition for backward compatibility.
+        5. No TypeScript API changes -- the WASM boundary is unaffected.
+
+    Blockers:
+        - No audited Rust ML-KEM/ML-DSA crate with wasm32 support.
+        - WASM binary size will grow significantly with PQ code.
+        - The crypto swap itself is contained (~crypto.rs, keys.rs,
+          envelope.rs wrapping, wire format), but must not ship before
+          the underlying library is trustworthy.
+
+
+ENVELOPE FORMAT
+---------------
+
+Envelopes are serialized as JSON:
+
+    {
+        "version": 1,
+        "ciphertext": "<base64>",
+        "recipients": [
+            {
+                "user_id": "alice",
+                "ephemeral_public": "<base64>",
+                "encrypted_dek": "<base64>"
+            },
+            {
+                "user_id": "bob",
+                "ephemeral_public": "<base64>",
+                "encrypted_dek": "<base64>"
+            }
+        ],
+        "metadata": { "type": "message", "timestamp": 1700000000 },
+        "signer_id": "alice",
+        "signature": "<base64>",
+        "audit_hash": "<base64>"
+    }
+
+Optional fields:
+  - metadata:    Unencrypted application data (omitted if not provided).
+  - signer_id:   User ID of the sealer (present on all envelopes).
+  - signature:   Ed25519 signature over the envelope (present on all
+                 envelopes). The public API (open, groupOpen) requires
+                 envelopes to be signed. Use openUnverified() to decrypt
+                 unsigned envelopes at your own risk.
+  - audit_hash:  SHA-256 hash of the latest audit log entry (chain head).
+                 Links the envelope to its audit trail. Omitted if not set.
+
+Group envelopes include two additional fields and MUST be signed:
+  - group_id:     Group identifier (present for group-encrypted envelopes).
+                  Recipients list is empty; access is via the group key.
+  - wrapped_dek:  DEK wrapped with the GEK (AES-256-GCM, base64).
+                  AD = "veil-group-dek:" + group_id.
+
+Group Key Bundle format:
+
+    {
+        "version": 1,
+        "group_id": "team-engineering",
+        "epoch": 1,
+        "members": [
+            {
+                "user_id": "alice",
+                "ephemeral_public": "<base64>",
+                "encrypted_dek": "<base64>"
+            }
+        ],
+        "signer_id": "alice",
+        "signature": "<base64>"
+    }
+
+The `members` array wraps the 32-byte GEK per-member using ECIES (same
+scheme as DEK wrapping). `epoch` starts at 1 and increments on GEK rotation
+(member removal). The bundle is signed by the signer (creator or modifier).
+
+Stream Header format:
+
+    {
+        "version": 1,
+        "chunk_size": 65536,
+        "nonce_prefix": "<base64, 8 bytes>",
+        "recipients": [ ... ],
+        "metadata": { "type": "file", "name": "report.pdf" },
+        "signer_id": "alice",
+        "signature": "<base64>",
+        "group_id": "...",
+        "wrapped_dek": "..."
+    }
+
+Per-recipient streams use `recipients` (same as envelope DEK wrapping).
+Group streams use `group_id` + `wrapped_dek` (DEK wrapped with GEK).
+Each encrypted chunk is binary: `is_final(1) || ciphertext || tag(16)`.
+
+The envelope is opaque to the server and to the application. Pass it around
+as a JSON string -- only Veil clients with the right private key can read it.
+
+
+SECURITY PROPERTIES
+-------------------
+
+WHAT VEIL PROVIDES
+
+    Authenticated encryption
+        AES-256-GCM provides both confidentiality and integrity.
+        Any tampering with ciphertext, nonce, or associated data is
+        detected and causes decryption to fail.
+
+    Sender authentication (Ed25519 signatures)
+        Every sealed envelope is signed with the sealer's Ed25519 key.
+        Recipients can verify who created the envelope by calling
+        verify(). The signature covers the version, signer ID,
+        ciphertext, metadata, and the full access data (recipient list
+        for direct envelopes, group info for group envelopes). Adding
+        or removing recipients requires re-signing the envelope.
+
+    Per-recipient key isolation
+        Each recipient's wrapped DEK is bound to their public key via
+        the AEAD associated data. A wrapped key cannot be moved to a
+        different recipient.
+
+    Ephemeral key wrapping
+        Each wrap operation uses a fresh X25519 key pair. Compromise of
+        one ephemeral key does not affect other wraps.
+
+    Context-bound key derivation
+        HKDF info binds both the ephemeral and recipient public keys,
+        preventing cross-context key confusion.
+
+    Low-order point rejection
+        DH outputs are validated via was_contributory() to reject
+        degenerate public keys (all-zeros, small-subgroup).
+
+    Secret memory zeroization
+        All secret material (DH secrets, signing secrets, DEKs, wrapping
+        keys) is wrapped in Zeroizing<T> and automatically cleared when
+        dropped.
+
+    At-rest key protection
+        The identity secret keys (DH + signing) are encrypted with a
+        non-extractable WebCrypto AES-256-GCM CryptoKey stored in
+        IndexedDB. This protects against localStorage-only theft
+        (browser backups, sync, extensions reading storage without code
+        execution).
+
+    TOFU key pinning
+        On first contact with a user, both their DH and signing public
+        keys are pinned in localStorage. Subsequent fetches verify
+        against the pins. If either key has changed, the operation fails
+        with a clear warning. trustKey() allows accepting legitimate key
+        rotations.
+
+    Authenticated key distribution
+        An optional Bearer auth token is included in all HTTP requests,
+        enabling the server to enforce that only the key owner can
+        update their public keys.
+
+    Password-based identity export
+        PBKDF2-SHA256 (1,000,000 iterations) + AES-256-GCM protects
+        exported identity keys for cross-device recovery. The export
+        blob includes both DH and signing secrets. A minimum password
+        length of 16 characters is enforced.
+
+    Server zero-knowledge
+        The server never sees plaintext, DEKs, or private keys.
+        It stores and serves public keys and opaque envelopes.
+
+    Group key rotation on member removal
+        removeGroupMember() generates a new GEK (incrementing the
+        epoch) and re-wraps for remaining members. The removed
+        member's old GEK cannot decrypt envelopes sealed after
+        the rotation.
+
+    Hard revocation
+        reseal() generates a new DEK and re-encrypts the data. Even
+        if a removed user cached the old DEK, it no longer works.
+
+    Streaming chunk authentication
+        Each chunk is encrypted with a unique nonce (random prefix +
+        counter) and authenticated with associated data that binds the
+        chunk index and finality flag. Reordering, duplication, or
+        truncation of chunks causes decryption to fail.
+
+    Tamper-evident audit trail
+        Audit log entries form a SHA-256 hash chain with Ed25519
+        signatures. Each entry records who performed what action and
+        when. Chain linkage makes the log append-only: inserting,
+        deleting, or reordering entries is detectable. The envelope's
+        audit_hash field anchors the log to the envelope, ensuring
+        the audit trail matches the current state.
+
+    Key caching with epoch-bound staleness detection
+        The KeyCache stores public key bundles in memory, reducing
+        server round-trips. The GekCache stores unwrapped GEKs keyed
+        by (group_id, epoch), so stale entries from before a key
+        rotation are automatically rejected. Both caches are invalidated
+        by trustKey() and clearCaches().
+
+    Deterministic auto-group IDs
+        Auto-group IDs are computed from a sorted, deduplicated list of
+        participant IDs via SHA-256. The same set of participants always
+        produces the same group ID, regardless of order or duplicates.
+        The "veil-auto-group-v1" domain separator prevents collisions
+        with manually created group IDs.
+
+    Post-quantum readiness
+        The architecture (group envelopes, key caching, extensible key
+        bundles) is designed to absorb the cost of PQ key sizes (3+ KB
+        per user) without per-message overhead explosion. A future
+        migration to ML-KEM-768 + ML-DSA-65 requires only internal
+        changes -- the API surface remains unchanged.
+
+REMAINING RISKS
+
+    Full XSS with code execution
+        An attacker who can run arbitrary JavaScript can call
+        crypto.subtle.decrypt() with the CryptoKey from IndexedDB.
+        The non-extractable flag prevents exporting the key but not
+        using it. This is a fundamental browser limitation.
+
+    Active MITM before first contact
+        TOFU key pinning protects against key substitution after the
+        first contact, but not during it. Mitigations:
+          * Always use HTTPS.
+          * Provide the auth_token to authenticate key operations.
+          * Allow users to verify public keys out-of-band.
+
+    Soft revocation is not true revocation
+        Removing a recipient's wrapped key prevents future unwrapping,
+        but a user who previously decrypted the envelope may have cached
+        the DEK. Use reseal() for true revocation.
+
+    IndexedDB cleared without localStorage
+        If a user clears IndexedDB but not localStorage, the encrypted
+        identity keys become undecryptable. The user must recover via
+        importIdentity() with their password-encrypted backup blob.
+
+    Metadata
+        Veil encrypts data content, not metadata. The server knows which
+        users have public keys, can observe envelope sizes, and can read
+        any unencrypted metadata attached to envelopes.
+
+RECOMMENDATIONS FOR PRODUCTION USE
+
+    1. Always serve your application over HTTPS.
+
+       Veil encrypts data end-to-end, but TOFU key pinning relies on the
+       first key fetch being legitimate. Without HTTPS, an active network
+       attacker can substitute public keys during the initial exchange.
+       HTTPS ensures the transport layer is authenticated before TOFU pins
+       are established.
+
+    2. Pass an auth_token to VeilClient.init() to authenticate key ops.
+
+       Without an auth token, anyone can overwrite a user's public keys on
+       the server. The token lets your server enforce that only the key owner
+       can PUT to /veil/keys/:userId. Use your existing session or JWT tokens.
+
+    3. Rate-limit the key endpoints to prevent abuse.
+
+       The GET /veil/keys/:userId endpoint is called whenever a user seals
+       data for a recipient (unless cached). Without rate limiting, a
+       malicious client could enumerate all user IDs or flood the endpoint.
+       Apply standard rate limiting per-IP and per-authenticated-user.
+
+    4. Prompt users to exportIdentity() on first init (isNewIdentity()).
+
+       Identity keys are stored locally (localStorage + IndexedDB). If
+       the user clears browser data, switches devices, or IndexedDB is
+       wiped, the keys are lost. exportIdentity() creates a password-
+       encrypted backup blob that can be imported elsewhere. Show a
+       one-time prompt when isNewIdentity() returns true, and let the
+       user download or copy the blob.
+
+    5. Use reseal() for hard revocation rather than just removing recipients.
+
+       removeRecipient() is a soft revocation: it removes the wrapped DEK
+       from the envelope, but if the removed user previously decrypted the
+       data and cached the DEK, they can still decrypt. reseal() generates
+       a new DEK, re-encrypts the data, and re-wraps for remaining
+       recipients -- making previously cached DEKs useless. Always reseal
+       when revoking access to sensitive data.
+
+    6. open() verifies signatures automatically.
+
+       open() fetches the signer's key, TOFU-verifies it, and checks the
+       Ed25519 signature before decrypting. This prevents a recipient from
+       forging envelopes that appear to come from someone else. Use
+       openUnverified() only when the signer's key is unavailable (e.g.
+       offline/cached envelopes) and you accept the risk.
+
+    7. Only include non-sensitive data in envelope metadata (it is not encrypted).
+
+       The metadata field is stored in plaintext alongside the encrypted
+       ciphertext. It is visible to the server and anyone with access to
+       the stored envelope. Use it for routing, indexing, or display
+       purposes (e.g. message type, timestamp, sender name) -- never for
+       data that should be confidential.
+
+    8. Consider adding envelope expiry or versioning at the application level.
+
+       Veil envelopes do not expire -- they are decryptable as long as the
+       recipient holds the correct private key. If your application needs
+       time-limited access, implement expiry at the application layer
+       (e.g. a "valid_until" field in metadata, enforced by your backend
+       before serving the envelope). Similarly, if you need to track
+       envelope versions (e.g. after reseal), use metadata or your own
+       database fields.
+
+    9. Use autoSeal/autoOpen for recurring conversations (DMs, threads).
+
+       For conversations between the same set of participants, autoSeal
+       creates a deterministic group key on first use and reuses it for
+       subsequent messages. This amortizes the per-recipient ECIES wrapping
+       cost: one KEM operation per group creation instead of one per message
+       per recipient. This is especially important for post-quantum
+       readiness, where KEM operations involve larger keys. autoOpen
+       transparently dispatches between direct and group decryption, so
+       the calling code doesn't need to track which mode was used.
+
+   10. Call clearCaches() when switching user contexts or after long idle periods.
+
+       The KeyCache and GekCache store public keys and unwrapped GEKs in
+       memory. If your application allows switching between user accounts
+       (e.g. multi-account support), call clearCaches() when switching to
+       prevent stale keys from one session leaking into another. For long-
+       lived tabs, periodic cache clearing ensures keys are re-fetched and
+       TOFU-verified, catching any key rotations that occurred while idle.

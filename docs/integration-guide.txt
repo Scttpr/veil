@@ -1,0 +1,191 @@
+
+INTEGRATION GUIDE
+-----------------
+
+STEP 1: ADD THE WASM MODULE TO YOUR WEB APPLICATION
+
+Copy the contents of pkg/ into your static assets, or publish it to npm
+and install it as a dependency.
+
+    your-app/
+    +-- static/
+    |   +-- e2e_encrypt_bg.wasm
+    |   +-- e2e_encrypt.js
+    +-- index.html
+
+
+STEP 2: IMPLEMENT THE SERVER ENDPOINTS
+
+Veil requires your server to implement two REST endpoints for public key
+distribution. When an auth_token is provided to VeilClient.init(), all
+requests include an Authorization: Bearer <token> header.
+
+    PUT /veil/keys/:userId
+
+        Stores a user's public keys. Called once during initialization.
+        The server MUST validate that only the key owner can update their keys
+        (check the Bearer token against the userId).
+
+        Request body:
+        {
+            "publicKey": "<base64>",
+            "signingKey": "<base64>"
+        }
+        Headers:  Authorization: Bearer <token>  (if auth_token provided)
+        Response: 200 OK
+
+    GET /veil/keys/:userId
+
+        Fetches a user's public keys.
+
+        Response body:
+        {
+            "publicKey": "<base64>",
+            "signingKey": "<base64>"
+        }
+        Headers:  Authorization: Bearer <token>  (if auth_token provided)
+        Error: 404 if user not found
+
+Example server implementation (pseudocode):
+
+    keys = {}
+
+    on PUT /veil/keys/:userId:
+        assert request.user == userId    // auth check
+        keys[userId] = {
+            publicKey: request.body.publicKey,
+            signingKey: request.body.signingKey,
+        }
+        respond 200
+
+    on GET /veil/keys/:userId:
+        entry = keys[userId]
+        if not entry: respond 404
+        respond { "publicKey": entry.publicKey, "signingKey": entry.signingKey }
+
+In production, store keys in your database alongside user accounts.
+Both keys are uploaded once and change only if the user reinitializes.
+
+    PUT /veil/groups/:groupId
+
+        Stores a group key bundle. Called when creating/updating a group.
+        The server MUST validate that only authorized group members can
+        update the bundle (check the Bearer token).
+
+        Request body: GroupKeyBundle JSON (see docs/architecture.txt)
+        Headers:  Authorization: Bearer <token>  (if auth_token provided)
+        Response: 200 OK
+
+    GET /veil/groups/:groupId
+
+        Fetches a group key bundle.
+
+        Response body: GroupKeyBundle JSON
+        Headers:  Authorization: Bearer <token>  (if auth_token provided)
+        Error: 404 if group not found
+
+
+STEP 3: USE THE SDK IN YOUR FRONTEND
+
+    import init, { VeilClient } from "./static/e2e_encrypt.js";
+
+    // Initialize the WASM module (must be called once)
+    await init();
+
+    // Initialize the Veil client. Generates (or loads) identity keys
+    // (X25519 for encryption + Ed25519 for signing) and uploads public
+    // keys to the server.
+    const alice = await VeilClient.init("alice", "https://yourserver.com", authToken);
+
+    // On first initialization, prompt the user to back up their key.
+    if (alice.isNewIdentity()) {
+        const blob = alice.exportIdentity(userPassword);
+        // Store blob securely (e.g., let user download it)
+    }
+
+    // Seal data for one or more recipients.
+    // Alice is always included as a recipient automatically.
+    // Optional metadata (3rd argument) is stored unencrypted.
+    const envelope = await alice.seal(
+        "alice@mail.com",
+        ["bob"],
+        JSON.stringify({ type: "email", timestamp: Date.now() })
+    );
+
+    // Store the envelope wherever you like (database, API, etc.)
+    // It is just an opaque JSON string.
+    await fetch("/api/user/alice/email", {
+        method: "PUT",
+        body: envelope,
+    });
+
+
+STEP 4: ANOTHER USER OPENS THE ENVELOPE
+
+    const bob = await VeilClient.init("bob", "https://yourserver.com", bobAuthToken);
+
+    // Fetch the envelope from your API
+    const envelope = await fetch("/api/user/alice/email").then(r => r.text());
+
+    // Open it -- Veil verifies the signature, unwraps the DEK, decrypts.
+    const email = await bob.open(envelope);
+    // email === "alice@mail.com"
+
+
+STEP 5: GRANT OR REVOKE ACCESS
+
+    // Alice wants to grant access to Charlie
+    const updated = await alice.addRecipient(envelope, "charlie");
+    // Store the updated envelope (it now has 3 recipients)
+    // The envelope is re-signed by Alice.
+
+    // Alice wants to revoke Bob's access (soft)
+    const revoked = alice.removeRecipient(updated, "bob");
+    // Bob can no longer unwrap the DEK from this envelope
+
+    // For hard revocation -- re-encrypt with a new DEK
+    const resealed = await alice.reseal(revoked, ["charlie"]);
+    // Even if Bob cached the old DEK, it no longer decrypts the data.
+    // The resealed envelope is signed by Alice.
+
+
+PRACTICAL EXAMPLE: ENCRYPTED USER PROFILE
+------------------------------------------
+
+Suppose you have a Python REST API with a /user/:id endpoint. You want to
+encrypt the user's email so the server never sees it.
+
+    // On signup -- Alice seals her email for herself
+    const alice = await VeilClient.init("alice", "/veil", aliceToken);
+    const sealed = await alice.seal("alice@mail.com", []);
+    await fetch("/api/user/alice", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: sealed }),
+    });
+
+    // Later -- Bob needs Alice's email
+    // Step 1: Bob requests access (your app logic)
+    // Step 2: Alice's client grants access
+    const envelope = await fetch("/api/user/alice")
+        .then(r => r.json())
+        .then(j => j.email);
+    const updated = await alice.addRecipient(envelope, "bob");
+    await fetch("/api/user/alice", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: updated }),
+    });
+
+    // Step 3: Bob can now decrypt
+    const bob = await VeilClient.init("bob", "/veil", bobToken);
+    const envelope2 = await fetch("/api/user/alice")
+        .then(r => r.json())
+        .then(j => j.email);
+
+    // open() verifies the signature and decrypts
+    const email = await bob.open(envelope2);
+    // email === "alice@mail.com"
+
+The server stores the envelope as an opaque JSON blob. It never sees the
+email address. Only authorized recipients can decrypt it.
