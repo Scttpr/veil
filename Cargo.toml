@@ -1,0 +1,68 @@
+[package]
+name = "veil"
+version = "0.1.0"
+edition = "2021"
+description = "Veil — end-to-end encryption SDK for the web (Rust/WASM)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+x25519-dalek = { version = "2", features = ["getrandom", "static_secrets", "zeroize"] }
+ed25519-dalek = { version = "2", features = ["zeroize"] }
+aes-gcm = { version = "0.10", features = ["zeroize"] }
+hkdf = "0.12"
+sha2 = "0.10"
+base64ct = { version = "1", features = ["alloc"] }
+getrandom = { version = "0.2", features = ["js"] }
+pbkdf2 = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zeroize = "1"
+
+[dependencies.web-sys]
+version = "0.3"
+features = [
+    "Window",
+    "Storage",
+    "Request",
+    "RequestInit",
+    "RequestMode",
+    "Headers",
+    "Response",
+    "console",
+]
+
+[features]
+test-utils = []
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+all = { level = "warn", priority = -1 }
+# Strict lints
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+indexing_slicing = "warn"
+arithmetic_side_effects = "warn"
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+cast_precision_loss = "warn"
+float_cmp = "warn"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+# Allow reasonable exceptions
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_docs_in_private_items = "allow"
+future_not_send = "allow"            # WASM is single-threaded
