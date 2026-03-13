@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Veil — E2E Encryption Demo</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0a0a0a;
+      color: #e0e0e0;
+      padding: 2rem;
+      max-width: 960px;
+      margin: 0 auto;
+    }
+    h1 { color: #fff; margin-bottom: 0.25rem; font-size: 1.75rem; }
+    h2 { color: #fff; margin: 2rem 0 0.75rem; font-size: 1.2rem; }
+    .subtitle { color: #888; margin-bottom: 1.5rem; font-size: 0.95rem; }
+    .actions { display: flex; gap: 0.75rem; margin-bottom: 1.5rem; }
+    button {
+      background: #2563eb;
+      color: white;
+      border: none;
+      padding: 0.6rem 1.5rem;
+      border-radius: 6px;
+      font-size: 0.9rem;
+      cursor: pointer;
+    }
+    button:hover { background: #1d4ed8; }
+    button:disabled { background: #333; color: #666; cursor: not-allowed; }
+    button.secondary { background: #333; color: #ccc; }
+    button.secondary:hover { background: #444; }
+    #log {
+      background: #111;
+      border: 1px solid #222;
+      border-radius: 8px;
+      padding: 1.5rem;
+      font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+      font-size: 0.82rem;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      word-break: break-all;
+      overflow-y: auto;
+      max-height: 60vh;
+      min-height: 120px;
+    }
+    .step { color: #60a5fa; font-weight: bold; }
+    .ok   { color: #34d399; }
+    .val  { color: #fbbf24; }
+    .dim  { color: #666; }
+    .err  { color: #f87171; }
+
+    /* --- DB viewer --- */
+    .db-section { margin-top: 0.5rem; }
+    .db-hint {
+      color: #555;
+      font-size: 0.8rem;
+      margin-bottom: 1rem;
+      font-family: monospace;
+    }
+    .db-table-wrap {
+      background: #111;
+      border: 1px solid #222;
+      border-radius: 8px;
+      overflow-x: auto;
+      margin-bottom: 1.25rem;
+    }
+    .db-table-label {
+      color: #60a5fa;
+      font-size: 0.85rem;
+      font-weight: 600;
+      padding: 0.75rem 1rem 0;
+    }
+    .db-empty {
+      color: #555;
+      padding: 0.75rem 1rem 1rem;
+      font-size: 0.8rem;
+      font-style: italic;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      font-size: 0.78rem;
+    }
+    th {
+      text-align: left;
+      padding: 0.5rem 1rem;
+      border-bottom: 1px solid #2a2a2a;
+      color: #888;
+      font-weight: 500;
+    }
+    td {
+      padding: 0.5rem 1rem;
+      border-bottom: 1px solid #1a1a1a;
+      max-width: 350px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: #ccc;
+    }
+    td.opaque { color: #f87171; }
+  </style>
+</head>
+<body>
+  <h1>Veil</h1>
+  <p class="subtitle">End-to-end encryption for the web — live demo</p>
+
+  <div class="actions">
+    <button id="run">Run Demo</button>
+    <button id="view-db" class="secondary">Refresh DB</button>
+  </div>
+
+  <div id="log"></div>
+
+  <div class="db-section">
+    <h2>Server Database (SQLite)</h2>
+    <p class="db-hint">
+      The server only stores opaque data. Inspect it yourself:
+      docker exec -it veil-demo sqlite3 /app/data/veil.db "SELECT * FROM envelopes;"
+    </p>
+    <div id="db"></div>
+  </div>
+
+  <script type="module">
+    import init, { VeilClient } from "/pkg/veil.js";
+
+    const logEl   = document.getElementById("log");
+    const dbEl    = document.getElementById("db");
+    const btnRun  = document.getElementById("run");
+    const btnDb   = document.getElementById("view-db");
+    const SERVER  = window.location.origin;
+
+    // --- Log helpers ---
+
+    function print(msg, cls) {
+      const span = document.createElement("span");
+      span.className = cls || "";
+      span.textContent = msg + "\n";
+      logEl.appendChild(span);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    function step(t)       { print(`\n=> ${t}`, "step"); }
+    function ok(m)         { print(`  + ${m}`, "ok"); }
+    function val(label, v) {
+      const s = typeof v === "string" ? v : JSON.stringify(v);
+      print(`  ${label}: ${s.length > 100 ? s.slice(0, 100) + "..." : s}`, "val");
+    }
+    function dim(m) { print(`  ${m}`, "dim"); }
+
+    // --- Store envelope on server ---
+
+    async function storeEnvelope(label, envelope) {
+      await fetch(`${SERVER}/veil/envelopes`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ label, envelope }),
+      });
+    }
+
+    // --- DB viewer ---
+
+    function truncate(s, n) {
+      return s.length > n ? s.slice(0, n) + "\u2026" : s;
+    }
+
+    function renderTable(title, columns, rows) {
+      const wrap = document.createElement("div");
+      wrap.className = "db-table-wrap";
+
+      const label = document.createElement("div");
+      label.className = "db-table-label";
+      label.textContent = title;
+      wrap.appendChild(label);
+
+      if (!rows.length) {
+        const empty = document.createElement("div");
+        empty.className = "db-empty";
+        empty.textContent = "(empty)";
+        wrap.appendChild(empty);
+        return wrap;
+      }
+
+      const table = document.createElement("table");
+      const thead = document.createElement("thead");
+      const hr = document.createElement("tr");
+      for (const col of columns) {
+        const th = document.createElement("th");
+        th.textContent = col.label;
+        hr.appendChild(th);
+      }
+      thead.appendChild(hr);
+      table.appendChild(thead);
+
+      const tbody = document.createElement("tbody");
+      for (const row of rows) {
+        const tr = document.createElement("tr");
+        for (const col of columns) {
+          const td = document.createElement("td");
+          const raw = String(row[col.key] ?? "");
+          td.textContent = truncate(raw, col.max || 80);
+          if (col.opaque) td.className = "opaque";
+          td.title = raw;
+          tr.appendChild(td);
+        }
+        tbody.appendChild(tr);
+      }
+      table.appendChild(tbody);
+      wrap.appendChild(table);
+      return wrap;
+    }
+
+    async function refreshDb() {
+      const res = await fetch(`${SERVER}/veil/db`);
+      const data = await res.json();
+      dbEl.innerHTML = "";
+
+      dbEl.appendChild(renderTable("keys", [
+        { key: "user_id",     label: "user_id",     max: 30 },
+        { key: "public_key",  label: "public_key (X25519)",  max: 50, opaque: true },
+        { key: "signing_key", label: "signing_key (Ed25519)", max: 50, opaque: true },
+      ], data.keys));
+
+      dbEl.appendChild(renderTable("groups", [
+        { key: "group_id", label: "group_id", max: 30 },
+        { key: "bundle",   label: "bundle (encrypted wrapped keys)", max: 90, opaque: true },
+      ], data.groups));
+
+      dbEl.appendChild(renderTable("envelopes", [
+        { key: "id",         label: "id",  max: 5 },
+        { key: "label",      label: "label", max: 30 },
+        { key: "envelope",   label: "envelope (ciphertext — no plaintext on server)", max: 90, opaque: true },
+        { key: "created_at", label: "stored_at", max: 20 },
+      ], data.envelopes));
+    }
+
+    btnDb.addEventListener("click", refreshDb);
+
+    // --- Demo ---
+
+    btnRun.addEventListener("click", async () => {
+      btnRun.disabled = true;
+      logEl.textContent = "";
+
+      // Reset server DB for a clean run
+      await fetch(`${SERVER}/veil/reset`, { method: "POST" });
+
+      try {
+        step("Initializing WASM module");
+        await init();
+        ok("WASM loaded");
+
+        step("1. Initialize clients (Alice & Bob)");
+        const alice = await VeilClient.init("alice", SERVER);
+        const bob   = await VeilClient.init("bob", SERVER);
+        val("Alice public key", alice.publicKey());
+        val("Bob public key",   bob.publicKey());
+        ok("Both clients initialized, keys stored in DB");
+
+        step("2. Direct encryption: Alice -> Bob");
+        const secret = "Hello Bob! This message is end-to-end encrypted.";
+        dim(`Plaintext: "${secret}"`);
+        const envelopeJson = await alice.seal(secret, ["bob"], null);
+        const envelope = JSON.parse(envelopeJson);
+        val("Ciphertext", envelope.ciphertext);
+        val("Recipients", envelope.recipients.length + " wrapped keys");
+
+        await storeEnvelope("direct: alice -> bob", envelopeJson);
+        dim("Envelope stored in SQLite (only ciphertext hits the DB)");
+
+        const plaintext = await bob.open(envelopeJson);
+        ok(`Bob decrypted: "${plaintext}"`);
+
+        step("3. Signature verification");
+        await bob.verify(envelopeJson);
+        ok("Bob verified Alice's Ed25519 signature");
+
+        step("4. Recipient management");
+        const carol = await VeilClient.init("carol", SERVER);
+        val("Carol public key", carol.publicKey());
+
+        const withCarol = await alice.addRecipient(envelopeJson, "carol");
+        const carolPlain = await carol.open(withCarol);
+        ok(`Carol added and decrypted: "${carolPlain}"`);
+
+        const withoutCarol = alice.removeRecipient(withCarol, "carol");
+        ok("Carol removed from envelope (soft revocation)");
+
+        step("5. Reseal (hard revocation)");
+        const resealedJson = await alice.reseal(envelopeJson, ["bob"], null);
+        await storeEnvelope("reseal: alice -> bob (new DEK)", resealedJson);
+        const resealed = await bob.open(resealedJson);
+        ok(`Fresh DEK generated, Bob decrypted: "${resealed}"`);
+
+        step("6. Group encryption");
+        const bundleJson = await alice.createGroup("team-alpha", ["bob"]);
+        const bundle = JSON.parse(bundleJson);
+        val("Group ID", bundle.group_id);
+        val("Epoch", bundle.epoch);
+        val("Members", bundle.members.length);
+
+        const groupMsg = "Top secret team message, group encrypted.";
+        const groupEnvJson = await alice.groupSeal(groupMsg, "team-alpha", null);
+        await storeEnvelope("group: team-alpha", groupEnvJson);
+        val("Group ciphertext", JSON.parse(groupEnvJson).ciphertext);
+
+        const groupPlain = await bob.groupOpen(groupEnvJson);
+        ok(`Bob decrypted group message: "${groupPlain}"`);
+
+        step("7. Streaming encryption (chunked)");
+        const enc = new TextEncoder();
+        const dec = new TextDecoder();
+
+        const sealer = await alice.sealStreamInit(["bob"], null, null);
+        const headerJson = sealer.header();
+        dim("Stream header created and sent");
+
+        const chunk1 = sealer.sealChunk(enc.encode("Streaming "), false);
+        const chunk2 = sealer.sealChunk(enc.encode("encryption works!"), true);
+        dim(`Encrypted 2 chunks (${chunk1.length} + ${chunk2.length} bytes)`);
+        sealer.free();
+
+        const opener = await bob.openStreamInit(headerJson);
+        const pt1 = opener.openChunk(chunk1);
+        const pt2 = opener.openChunk(chunk2);
+        opener.free();
+
+        ok(`Bob reassembled: "${dec.decode(pt1) + dec.decode(pt2)}"`);
+
+        step("8. Audit log");
+        const entry1Json = alice.createAuditEntry("seal", "bob", Date.now(), undefined);
+        const entry1 = JSON.parse(entry1Json);
+        val("Entry hash", entry1.entry_hash);
+        val("Action", entry1.action + " by " + entry1.actor_id);
+
+        const anchoredJson = alice.anchorAudit(envelopeJson, entry1Json);
+        ok("Audit entry anchored to envelope");
+
+        await alice.verifyAuditLog(anchoredJson, `[${entry1Json}]`);
+        ok("Audit log verified: chain + signatures + anchor valid");
+
+        step("9. Identity export");
+        const backup = alice.exportIdentity("super-secret-backup-pw!!");
+        val("Encrypted backup", backup);
+        ok("Identity exported (PBKDF2-SHA256 1M rounds + AES-256-GCM)");
+
+        step("All done");
+        dim("Every operation ran client-side in WASM.");
+        dim("The server DB below only contains opaque ciphertext — never plaintext.");
+
+        alice.free();
+        bob.free();
+        carol.free();
+      } catch (e) {
+        print(`\n  ERROR: ${e.message || e}`, "err");
+        console.error(e);
+      } finally {
+        btnRun.disabled = false;
+        await refreshDb();
+      }
+    });
+
+    // Load DB on page load
+    refreshDb();
+  </script>
+</body>
+</html>

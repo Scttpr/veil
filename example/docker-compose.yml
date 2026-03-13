@@ -1,0 +1,9 @@
+services:
+  demo:
+    build:
+      context: ..
+      dockerfile: example/Dockerfile
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/app/data:Z
