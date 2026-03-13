@@ -1,0 +1,22 @@
+{
+  "name": "@veil/client",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Typed TypeScript wrapper for the Veil E2E encryption SDK",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist/"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "veil": "file:../pkg"
+  },
+  "devDependencies": {
+    "typescript": "^5.4"
+  },
+  "license": "MIT"
+}
