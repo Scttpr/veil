@@ -7,8 +7,8 @@ project. No custom cryptography, no novel constructions.
 
     Identity Keys .......... X25519 (key exchange) + Ed25519 (signing)
     Key Wrapping ........... ECIES (ephemeral X25519 DH + HKDF + AES-GCM)
-    Key Derivation ......... HKDF-SHA256 (context-bound: "veil-wrap" || keys)
-    Symmetric Encryption ... AES-256-GCM (authenticated encryption)
+    Key Derivation ......... HKDF-SHA256 (salt=eph_public, info="veil-wrap" || keys)
+    Symmetric Encryption ... AES-256-GCM (random 12-byte nonce, prepended to output)
     Streaming Encryption ... STREAM construction (AES-256-GCM per chunk)
     Envelope Signing ....... Ed25519 (deterministic signatures)
     Secret Zeroization ..... zeroize crate (Zeroizing<T> on all secrets)
@@ -21,6 +21,38 @@ project. No custom cryptography, no novel constructions.
 
 Each wrap operation uses a fresh ephemeral key pair. Even wrapping the same
 DEK for the same recipient twice produces different ciphertext.
+
+NONCE AND SALT HANDLING
+
+    AES-256-GCM nonce: Every symmetric encryption (data, DEK wrapping,
+    GEK wrapping, identity export) generates a fresh random 12-byte nonce
+    via getrandom (browser crypto.getRandomValues). The nonce is prepended
+    to the ciphertext: output = nonce(12) || ciphertext || tag(16).
+    Decryption extracts the first 12 bytes as the nonce automatically.
+    Because each encryption uses a unique random nonce and a unique key
+    (either a fresh DEK or a fresh HKDF-derived wrapping key), the
+    probability of nonce reuse is negligible.
+
+    HKDF salt: The ephemeral X25519 public key (32 bytes) serves as the
+    HKDF salt when deriving the wrapping key. Since each wrap generates a
+    fresh ephemeral key pair, the salt is unique per operation. This
+    provides domain separation at the extract step, independent of the
+    info string. Using the ephemeral public key as salt (rather than a
+    separate random value) avoids transmitting an additional field -- the
+    ephemeral public key is already included in the envelope for the
+    recipient to reconstruct the shared secret.
+
+    PBKDF2 salt (identity export): A random 16-byte salt is generated per
+    export and stored in the blob: version(2) || salt(16) || AES-GCM(...).
+    This ensures that exporting the same identity with the same password
+    produces different blobs, and prevents precomputed dictionary attacks.
+    The salt is combined with 1,000,000 PBKDF2-HMAC-SHA256 iterations.
+
+    Streaming nonce: Streams use a deterministic nonce construction:
+    random_prefix(8) || chunk_index(4 BE). The 8-byte random prefix
+    (generated once per stream, stored in the header) prevents nonce
+    collision across streams. The 4-byte big-endian counter prevents
+    reuse within a stream and binds each chunk to its position.
 
 The HKDF info string binds both the ephemeral and recipient public keys:
 "veil-wrap" || ephemeral_public || recipient_public. The associated data
@@ -185,8 +217,10 @@ WHAT VEIL PROVIDES
 
     Authenticated encryption
         AES-256-GCM provides both confidentiality and integrity.
-        Any tampering with ciphertext, nonce, or associated data is
-        detected and causes decryption to fail.
+        A fresh random 12-byte nonce is generated for every encryption
+        operation and prepended to the output. Any tampering with
+        ciphertext, nonce, or associated data is detected and causes
+        decryption to fail.
 
     Sender authentication (Ed25519 signatures)
         Every sealed envelope is signed with the sealer's Ed25519 key.
@@ -207,7 +241,9 @@ WHAT VEIL PROVIDES
 
     Context-bound key derivation
         HKDF info binds both the ephemeral and recipient public keys,
-        preventing cross-context key confusion.
+        preventing cross-context key confusion. The ephemeral public key
+        doubles as the HKDF salt, ensuring a unique extract step per
+        wrapping operation without requiring an additional random field.
 
     Low-order point rejection
         DH outputs are validated via was_contributory() to reject
@@ -239,8 +275,10 @@ WHAT VEIL PROVIDES
 
     Password-based identity export
         PBKDF2-SHA256 (1,000,000 iterations) + AES-256-GCM protects
-        exported identity keys for cross-device recovery. The export
-        blob includes both DH and signing secrets. A minimum password
+        exported identity keys for cross-device recovery. A random
+        16-byte salt is generated per export and stored in the blob,
+        preventing precomputed dictionary attacks. The export blob
+        includes both DH and signing secrets. A minimum password
         length of 16 characters is enforced.
 
     Server zero-knowledge
@@ -258,8 +296,10 @@ WHAT VEIL PROVIDES
         if a removed user cached the old DEK, it no longer works.
 
     Streaming chunk authentication
-        Each chunk is encrypted with a unique nonce (random prefix +
-        counter) and authenticated with associated data that binds the
+        Each chunk is encrypted with a unique nonce constructed as
+        random_prefix(8) || chunk_index(4 BE). The random prefix
+        prevents nonce collision across different streams; the counter
+        prevents reuse within a stream. Associated data binds the
         chunk index and finality flag. Reordering, duplication, or
         truncation of chunks causes decryption to fail.
 

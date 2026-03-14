@@ -40,16 +40,20 @@ authentication.
 
      a. A random 256-bit Data Encryption Key (DEK) is generated.
      b. The data is encrypted with the DEK using AES-256-GCM.
+        A random 12-byte nonce is generated for each encryption.
+        Output: nonce(12) || ciphertext || tag(16).
      c. For each authorized recipient (including the sealer), the DEK is
         wrapped using ECIES:
 
             i.   Generate a fresh ephemeral X25519 key pair.
             ii.  DH(ephemeral_secret, recipient_public) -> shared secret.
             iii. HKDF-SHA256(shared_secret,
+                     salt=eph_public,
                      info="veil-wrap" || eph_public || recipient_public)
                      -> wrapping key.
             iv.  AES-256-GCM(wrapping_key, DEK, ad=recipient_public)
                  -> encrypted DEK.
+                 Output: nonce(12) || encrypted_dek(32) || tag(16).
 
      d. The envelope is signed with the sealer's Ed25519 key. The signature
         covers: "veil-sig-v1" || version(1) || has_signer(1) ||
@@ -162,8 +166,12 @@ authentication.
    Security:
      - Per-chunk authentication prevents reordering (nonce includes index).
      - The is_final flag in AD prevents truncation (removing the last chunk).
-     - Each stream uses a unique random nonce prefix.
-     - Overhead: 17 bytes per chunk (1 flag + 16 tag). No per-chunk nonce.
+     - Each stream uses a unique 8-byte random nonce prefix, combined with
+       a 4-byte big-endian chunk index to form the 12-byte AES-GCM nonce.
+       The random prefix prevents nonce reuse across streams; the counter
+       prevents reuse within a stream.
+     - Overhead: 17 bytes per chunk (1 flag + 16 tag). No per-chunk nonce
+       stored -- the nonce is reconstructed from the header prefix + index.
 
 8. WHAT THE SERVER SEES
 
