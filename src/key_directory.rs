@@ -169,20 +169,14 @@ mod tests {
 
     #[test]
     fn key_fingerprint_known_answer() {
-        // SHA-256 of 32 zero bytes = 66687aadf862bd776c8fc18b8e9f8e20...
+        // SHA-256 of 32 zero bytes: first 8 bytes are 66687aadf862bd77
         let zeros = [0u8; 32];
         let fp = key_fingerprint(&zeros);
         // Verify format: 8 colon-separated hex pairs
         assert_eq!(fp.split(':').count(), 8);
         assert!(fp.chars().all(|c| c.is_ascii_hexdigit() || c == ':'));
-        // Verify known answer (first 8 bytes of SHA-256 of 32 zero bytes)
-        let hash = crypto::sha256(&zeros);
-        let expected: String = hash[..8]
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<Vec<_>>()
-            .join(":");
-        assert_eq!(fp, expected);
+        // Hardcoded known answer (not re-derived)
+        assert_eq!(fp, "66:68:7a:ad:f8:62:bd:77");
     }
 
     #[test]

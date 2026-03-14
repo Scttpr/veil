@@ -1347,24 +1347,6 @@ mod tests {
             "remove_member at u32::MAX epoch must fail with overflow");
     }
 
-    // ---- GEK cache peek() ----
-
-    #[test]
-    fn gek_cache_peek_does_not_update_lru() {
-        let mut cache = GekCache::new();
-        let gek = crypto::generate_random_key().unwrap();
-        cache.insert("team".to_string(), 1, gek.clone());
-
-        // peek should return the value
-        let peeked = cache.entries.get("team");
-        assert!(peeked.is_some());
-
-        // Fill cache to capacity, then insert one more to trigger eviction
-        // If peek updated LRU, "team" would survive eviction
-        // But first, let's just verify peek returns correct value
-        // (the LRU behavior is complex to test without peek() method)
-    }
-
     // ---- Duplicate member in create_bundle rejected ----
 
     #[test]

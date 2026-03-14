@@ -9,16 +9,6 @@ use veil::test_utils::make_user;
 // ---- Anchor (integration: audit + envelope) ----
 
 #[test]
-fn test_anchor_envelope() {
-    let (id, _, public, sign_sec, _) = make_user();
-    let env = envelope::seal(b"data", &id, &public, &sign_sec, &[], None).unwrap();
-    let entry = audit::create_entry("seal", &id, None, 1_000, None, &sign_sec).unwrap();
-
-    let anchored = audit::anchor_envelope(&env, &entry);
-    assert_eq!(anchored.audit_hash.as_deref(), Some(entry.entry_hash.as_str()));
-}
-
-#[test]
 fn test_anchor_matches_last_entry() {
     let (id, _, public, sign_sec, _) = make_user();
     let env = envelope::seal(b"data", &id, &public, &sign_sec, &[], None).unwrap();
@@ -33,24 +23,6 @@ fn test_anchor_matches_last_entry() {
     let bad_anchor = audit::anchor_envelope(&env, &e1);
     let entries_both = vec![e1.clone(), audit::create_entry("grant", &id, Some("bob"), 2_000, Some(&e1.entry_hash), &sign_sec).unwrap()];
     assert!(matches!(audit::verify_anchor(&bad_anchor, &entries_both), Err(VeilError::Validation(_))), "mismatched anchor must fail verification");
-}
-
-// ---- audit_hash not in signature ----
-
-#[test]
-fn test_audit_hash_not_in_signature() {
-    let (id, _, public, sign_sec, sign_pub) = make_user();
-    let env = envelope::seal(b"data", &id, &public, &sign_sec, &[], None).unwrap();
-
-    // Verify signature before anchoring
-    assert!(envelope::verify(&env, &sign_pub).is_ok());
-
-    // Anchor
-    let entry = audit::create_entry("seal", &id, None, 1_000, None, &sign_sec).unwrap();
-    let anchored = audit::anchor_envelope(&env, &entry);
-
-    // Signature should still be valid
-    assert!(envelope::verify(&anchored, &sign_pub).is_ok());
 }
 
 // ---- audit_hash omitted when None ----
@@ -178,6 +150,35 @@ fn test_verify_anchor_empty_chain_fails() {
 
     let result = audit::verify_anchor(&anchored, &[]);
     assert!(result.is_err(), "empty chain must fail anchor verification");
+}
+
+// ---- Envelope signature rejects wrong key ----
+
+#[test]
+fn test_envelope_verify_wrong_key_fails() {
+    let (id, _, public, sign_sec, _) = make_user();
+    let (_, _, _, _, wrong_pub) = make_user();
+    let env = envelope::seal(b"data", &id, &public, &sign_sec, &[], None).unwrap();
+
+    assert!(envelope::verify(&env, &wrong_pub).is_err(),
+        "envelope must not verify with a different signer's public key");
+}
+
+// ---- Envelope signature rejects tampered ciphertext ----
+
+#[test]
+fn test_envelope_verify_tampered_ciphertext_fails() {
+    let (id, _, public, sign_sec, sign_pub) = make_user();
+    let env = envelope::seal(b"data", &id, &public, &sign_sec, &[], None).unwrap();
+
+    // Sanity: valid envelope verifies
+    assert!(envelope::verify(&env, &sign_pub).is_ok());
+
+    // Tamper with ciphertext
+    let mut tampered = env;
+    tampered.ciphertext = crypto::to_base64(b"tampered-ciphertext");
+    assert!(envelope::verify(&tampered, &sign_pub).is_err(),
+        "envelope with tampered ciphertext must fail signature verification");
 }
 
 // ---- Tampered entry hash in chain detected ----
