@@ -93,7 +93,7 @@ impl TryFrom<EnvelopeWire> for Envelope {
                 }
             }
         }
-        constants::validate_metadata(w.metadata.as_ref())?;
+        constants::validate_metadata(w.metadata.as_ref()).map(drop)?;
 
         let access = match (w.group_id, w.wrapped_dek) {
             (Some(group_id), Some(wrapped_dek)) => {
@@ -161,38 +161,54 @@ impl<'de> Deserialize<'de> for Envelope {
     }
 }
 
-// ---------- Convenience methods ----------
+// ---------- Convenience methods on Access ----------
 
-impl Envelope {
-    /// Whether this is a group envelope.
+impl EnvelopeAccess {
     pub const fn is_group(&self) -> bool {
-        matches!(self.access, EnvelopeAccess::Group { .. })
+        matches!(self, Self::Group { .. })
     }
 
-    /// The group ID, if this is a group envelope.
     pub fn group_id(&self) -> Option<&str> {
-        match &self.access {
-            EnvelopeAccess::Group { group_id, .. } => Some(group_id),
-            EnvelopeAccess::Direct { .. } => None,
+        match self {
+            Self::Group { group_id, .. } => Some(group_id),
+            Self::Direct { .. } => None,
         }
     }
 
-    /// The per-recipient wrapped keys. Empty for group envelopes.
     pub fn recipients(&self) -> &[WrappedKey] {
-        match &self.access {
-            EnvelopeAccess::Direct { recipients } => recipients,
-            EnvelopeAccess::Group { .. } => &[],
+        match self {
+            Self::Direct { recipients } => recipients,
+            Self::Group { .. } => &[],
         }
     }
 
-    /// The `(group_id, wrapped_dek)` pair, if this is a group envelope.
     pub fn group_info(&self) -> Option<(&str, &str)> {
-        match &self.access {
-            EnvelopeAccess::Group { group_id, wrapped_dek } => {
+        match self {
+            Self::Group { group_id, wrapped_dek } => {
                 Some((group_id, wrapped_dek))
             }
-            EnvelopeAccess::Direct { .. } => None,
+            Self::Direct { .. } => None,
         }
+    }
+}
+
+// ---------- Convenience delegates on Envelope ----------
+
+impl Envelope {
+    pub const fn is_group(&self) -> bool {
+        self.access.is_group()
+    }
+
+    pub fn group_id(&self) -> Option<&str> {
+        self.access.group_id()
+    }
+
+    pub fn recipients(&self) -> &[WrappedKey] {
+        self.access.recipients()
+    }
+
+    pub fn group_info(&self) -> Option<(&str, &str)> {
+        self.access.group_info()
     }
 }
 
@@ -216,13 +232,11 @@ pub fn wrap_dek(
     let (eph_secret, eph_public) = crypto::generate_key_pair()?;
     let shared = crypto::dh(&eph_secret, recipient_public)?;
 
-    let mut info = Vec::with_capacity(9 + 64);
-    info.extend_from_slice(DOMAIN_KEY_WRAP);
-    info.extend_from_slice(&eph_public);
-    info.extend_from_slice(recipient_public);
-    let wrapping_key_vec = crypto::hkdf_sha256(shared.as_ref(), Some(&eph_public), &info, 32)?;
-    let wrapping_key = Zeroizing::new(<[u8; 32]>::try_from(wrapping_key_vec.as_slice())
-        .map_err(|_| VeilError::Encoding("hkdf output not 32 bytes".into()))?);
+    let mut info = [0u8; 9 + 64];
+    info[..9].copy_from_slice(DOMAIN_KEY_WRAP);
+    info[9..41].copy_from_slice(&eph_public);
+    info[41..73].copy_from_slice(recipient_public);
+    let wrapping_key = crypto::hkdf_derive_key(shared.as_ref(), Some(&eph_public), &info)?;
 
     let encrypted = crypto::aead_encrypt(&wrapping_key, dek, recipient_public)?;
 
@@ -250,13 +264,11 @@ pub fn unwrap_dek(
 
     let shared = crypto::dh(our_secret, &eph_pub_bytes)?;
 
-    let mut info = Vec::with_capacity(9 + 64);
-    info.extend_from_slice(DOMAIN_KEY_WRAP);
-    info.extend_from_slice(&eph_pub_bytes);
-    info.extend_from_slice(our_public);
-    let wrapping_key_vec = crypto::hkdf_sha256(shared.as_ref(), Some(&eph_pub_bytes), &info, 32)?;
-    let wrapping_key = Zeroizing::new(<[u8; 32]>::try_from(wrapping_key_vec.as_slice())
-        .map_err(|_| VeilError::Encoding("hkdf output not 32 bytes".into()))?);
+    let mut info = [0u8; 9 + 64];
+    info[..9].copy_from_slice(DOMAIN_KEY_WRAP);
+    info[9..41].copy_from_slice(&eph_pub_bytes);
+    info[41..73].copy_from_slice(our_public);
+    let wrapping_key = crypto::hkdf_derive_key(shared.as_ref(), Some(&eph_pub_bytes), &info)?;
 
     let encrypted = crypto::from_base64(&wrapped.encrypted_dek)?;
     let dek_bytes = crypto::aead_decrypt(&wrapping_key, &encrypted, our_public)?;
@@ -315,6 +327,63 @@ pub(crate) fn append_recipients_to_payload(
     Ok(())
 }
 
+/// Append serialized metadata to a signature/header payload.
+///
+/// Uses `cached_bytes` if available, otherwise serializes from `metadata`.
+pub(crate) fn append_metadata_to_payload(
+    payload: &mut Vec<u8>,
+    metadata: &Option<serde_json::Value>,
+    cached_bytes: Option<&[u8]>,
+) -> Result<(), VeilError> {
+    if let Some(ref meta) = *metadata {
+        payload.push(1);
+        let meta_bytes: std::borrow::Cow<'_, [u8]> = if let Some(cached) = cached_bytes {
+            std::borrow::Cow::Borrowed(cached)
+        } else {
+            let serialized = serde_json::to_vec(meta)
+                .map_err(|e| VeilError::Encoding(format!("metadata serialize: {e}")))?;
+            std::borrow::Cow::Owned(serialized)
+        };
+        let meta_len: u32 = meta_bytes.len()
+            .try_into()
+            .map_err(|_| VeilError::Format("metadata too long for length prefix".into()))?;
+        payload.extend_from_slice(&meta_len.to_be_bytes());
+        payload.extend_from_slice(&meta_bytes);
+    } else {
+        payload.push(0);
+    }
+    Ok(())
+}
+
+/// Append access data (group or direct recipients) to a signature/header payload.
+pub(crate) fn append_access_to_payload(
+    payload: &mut Vec<u8>,
+    access: &EnvelopeAccess,
+) -> Result<(), VeilError> {
+    match access {
+        EnvelopeAccess::Group { group_id, wrapped_dek } => {
+            payload.push(1);
+            let gid_bytes = group_id.as_bytes();
+            let gid_len: u32 = gid_bytes.len()
+                .try_into()
+                .map_err(|_| VeilError::Format("group_id too long for length prefix".into()))?;
+            payload.extend_from_slice(&gid_len.to_be_bytes());
+            payload.extend_from_slice(gid_bytes);
+            let wd_bytes = wrapped_dek.as_bytes();
+            let wd_len: u32 = wd_bytes.len()
+                .try_into()
+                .map_err(|_| VeilError::Format("wrapped_dek too long for length prefix".into()))?;
+            payload.extend_from_slice(&wd_len.to_be_bytes());
+            payload.extend_from_slice(wd_bytes);
+        }
+        EnvelopeAccess::Direct { recipients } => {
+            payload.push(0);
+            append_recipients_to_payload(payload, recipients)?;
+        }
+    }
+    Ok(())
+}
+
 /// Build the deterministic byte payload that gets signed.
 ///
 /// Format: `"veil-sig-v1" || version(1) || signer_id_len(4 BE) || signer_id
@@ -336,7 +405,10 @@ pub(crate) fn append_recipients_to_payload(
 /// # Errors
 ///
 /// Returns `VeilError` if metadata serialization fails.
-pub(crate) fn signature_payload(envelope: &Envelope) -> Result<Vec<u8>, VeilError> {
+pub(crate) fn signature_payload(
+    envelope: &Envelope,
+    cached_metadata: Option<&[u8]>,
+) -> Result<Vec<u8>, VeilError> {
     let mut payload = Vec::new();
     payload.extend_from_slice(DOMAIN_SIG_V1);
     payload.push(envelope.version);
@@ -357,39 +429,8 @@ pub(crate) fn signature_payload(envelope: &Envelope) -> Result<Vec<u8>, VeilErro
         .map_err(|_| VeilError::Format("ciphertext too long for length prefix".into()))?;
     payload.extend_from_slice(&ct_len.to_be_bytes());
     payload.extend_from_slice(ct_bytes);
-    if let Some(ref meta) = envelope.metadata {
-        payload.push(1);
-        let meta_bytes = serde_json::to_vec(meta)
-            .map_err(|e| VeilError::Encoding(format!("metadata serialize: {e}")))?;
-        let meta_len: u32 = meta_bytes.len()
-            .try_into()
-            .map_err(|_| VeilError::Format("metadata too long for length prefix".into()))?;
-        payload.extend_from_slice(&meta_len.to_be_bytes());
-        payload.extend_from_slice(&meta_bytes);
-    } else {
-        payload.push(0);
-    }
-    match &envelope.access {
-        EnvelopeAccess::Group { group_id, wrapped_dek } => {
-            payload.push(1);
-            let gid_bytes = group_id.as_bytes();
-            let gid_len: u32 = gid_bytes.len()
-                .try_into()
-                .map_err(|_| VeilError::Format("group_id too long for length prefix".into()))?;
-            payload.extend_from_slice(&gid_len.to_be_bytes());
-            payload.extend_from_slice(gid_bytes);
-            let wd_bytes = wrapped_dek.as_bytes();
-            let wd_len: u32 = wd_bytes.len()
-                .try_into()
-                .map_err(|_| VeilError::Format("wrapped_dek too long for length prefix".into()))?;
-            payload.extend_from_slice(&wd_len.to_be_bytes());
-            payload.extend_from_slice(wd_bytes);
-        }
-        EnvelopeAccess::Direct { recipients } => {
-            payload.push(0);
-            append_recipients_to_payload(&mut payload, recipients)?;
-        }
-    }
+    append_metadata_to_payload(&mut payload, &envelope.metadata, cached_metadata)?;
+    append_access_to_payload(&mut payload, &envelope.access)?;
     Ok(payload)
 }
 
@@ -426,7 +467,7 @@ pub fn seal(
             constants::MAX_RECIPIENTS
         )));
     }
-    constants::validate_metadata(metadata.as_ref())?;
+    let meta_bytes = constants::validate_metadata(metadata.as_ref())?;
 
     if recipient_keys.iter().any(|(id, _)| *id == our_id) {
         return Err(VeilError::Validation("sealer already in recipient list".into()));
@@ -459,7 +500,7 @@ pub fn seal(
         audit_hash: None,
     };
 
-    let payload = signature_payload(&envelope)?;
+    let payload = signature_payload(&envelope, meta_bytes.as_deref())?;
     let sig = crypto::ed25519_sign(sign_secret, &payload);
     envelope.signature = Some(crypto::to_base64(&sig));
 
@@ -485,7 +526,7 @@ pub fn verify(
         .try_into()
         .map_err(|_| VeilError::Crypto("signature is not 64 bytes".into()))?;
 
-    let payload = signature_payload(envelope)?;
+    let payload = signature_payload(envelope, None)?;
     crypto::ed25519_verify(signer_public, &payload, &sig_bytes)
 }
 
@@ -582,7 +623,7 @@ pub fn add_recipient(
         audit_hash: envelope.audit_hash.clone(),
     };
 
-    let payload = signature_payload(&new_envelope)?;
+    let payload = signature_payload(&new_envelope, None)?;
     let sig = crypto::ed25519_sign(sign_secret, &payload);
     new_envelope.signature = Some(crypto::to_base64(&sig));
 
@@ -646,7 +687,7 @@ pub fn remove_recipient(
         audit_hash: envelope.audit_hash.clone(),
     };
 
-    let payload = signature_payload(&new_envelope)?;
+    let payload = signature_payload(&new_envelope, None)?;
     let sig = crypto::ed25519_sign(sign_secret, &payload);
     new_envelope.signature = Some(crypto::to_base64(&sig));
 
