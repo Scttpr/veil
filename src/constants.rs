@@ -35,6 +35,16 @@ pub const DOMAIN_GROUP_DEK: &[u8] = b"veil-group-dek:";
 /// AEAD associated data for identity export/import.
 pub const DOMAIN_EXPORT: &[u8] = b"veil-export";
 
+// ---------- AD construction ----------
+
+/// Build the associated data for group DEK wrapping: `"veil-group-dek:" || group_id`.
+pub fn group_dek_ad(group_id: &str) -> Vec<u8> {
+    let mut ad = Vec::with_capacity(DOMAIN_GROUP_DEK.len().saturating_add(group_id.len()));
+    ad.extend_from_slice(DOMAIN_GROUP_DEK);
+    ad.extend_from_slice(group_id.as_bytes());
+    ad
+}
+
 // ---------- Protocol limits ----------
 
 /// Maximum length of a user ID or group ID in bytes.
@@ -128,12 +138,17 @@ pub fn validate_auth_token(token: Option<&str>) -> Result<(), VeilError> {
     Ok(())
 }
 
-/// Validate optional metadata against the size limit.
+/// Validate and serialize optional metadata against the size limit.
+///
+/// Returns `Ok(None)` when metadata is absent, or `Ok(Some(bytes))` with
+/// the serialized JSON bytes when present and within limits. Callers that
+/// build signature payloads can reuse the returned bytes instead of
+/// re-serializing.
 ///
 /// # Errors
 ///
 /// Returns `VeilError::Validation` if the serialized metadata exceeds `MAX_METADATA_LEN`.
-pub fn validate_metadata(metadata: Option<&serde_json::Value>) -> Result<(), VeilError> {
+pub fn validate_metadata(metadata: Option<&serde_json::Value>) -> Result<Option<Vec<u8>>, VeilError> {
     if let Some(meta) = metadata {
         let serialized = serde_json::to_vec(meta)
             .map_err(|e| VeilError::Encoding(format!("metadata serialize: {e}")))?;
@@ -143,6 +158,8 @@ pub fn validate_metadata(metadata: Option<&serde_json::Value>) -> Result<(), Vei
                 serialized.len()
             )));
         }
+        Ok(Some(serialized))
+    } else {
+        Ok(None)
     }
-    Ok(())
 }
