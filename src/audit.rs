@@ -174,7 +174,7 @@ pub fn verify_entry(entry: &AuditEntry, signer_public: &[u8; 32]) -> Result<(), 
         .try_into()
         .map_err(|_| VeilError::Format("entry_hash is not 32 bytes".into()))?;
 
-    if expected_hash != actual_hash {
+    if !crypto::constant_time_eq(&expected_hash, &actual_hash) {
         return Err(VeilError::Validation("audit entry hash mismatch".into()));
     }
 
@@ -197,30 +197,32 @@ pub fn verify_entry(entry: &AuditEntry, signer_public: &[u8; 32]) -> Result<(), 
 /// `prev_hash`, any recomputed hash doesn't match the stored `entry_hash`,
 /// or any entry's `prev_hash` doesn't match the previous entry's hash.
 pub fn verify_chain(entries: &[AuditEntry]) -> Result<String, VeilError> {
-    let first = entries
-        .first()
-        .ok_or_else(|| VeilError::Encoding("audit chain is empty".into()))?;
-
-    let genesis_hash = crypto::to_base64(&genesis_prev_hash());
-
-    // Check genesis
-    if first.prev_hash != genesis_hash {
-        return Err(VeilError::Validation("first audit entry has wrong prev_hash (expected genesis)".into()));
+    if entries.is_empty() {
+        return Err(VeilError::Encoding("audit chain is empty".into()));
     }
 
-    // Recompute and verify each entry hash, then check linkage
-    let mut recomputed_hashes: Vec<String> = Vec::with_capacity(entries.len());
+    // Track the previous verified hash as raw bytes to avoid base64
+    // round-trips and enable constant-time comparison.
+    let mut prev_verified_raw = genesis_prev_hash();
+
     for entry in entries {
-        let prev_raw: [u8; 32] = crypto::from_base64(&entry.prev_hash)?
+        // Check linkage: this entry's prev_hash must match the previous verified hash
+        let entry_prev_raw: [u8; 32] = crypto::from_base64(&entry.prev_hash)?
             .try_into()
             .map_err(|_| VeilError::Format("prev_hash is not 32 bytes".into()))?;
+
+        if !crypto::constant_time_eq(&entry_prev_raw, &prev_verified_raw) {
+            return Err(VeilError::Validation(
+                "audit chain broken: prev_hash does not match previous entry_hash".into(),
+            ));
+        }
 
         let payload = entry_payload(
             &entry.action,
             &entry.actor_id,
             entry.target_id.as_deref(),
             entry.timestamp,
-            &prev_raw,
+            &entry_prev_raw,
         )?;
 
         let expected_hash = crypto::sha256(&payload);
@@ -228,29 +230,17 @@ pub fn verify_chain(entries: &[AuditEntry]) -> Result<String, VeilError> {
             .try_into()
             .map_err(|_| VeilError::Validation("entry_hash is not 32 bytes".into()))?;
 
-        if expected_hash != actual_hash {
+        if !crypto::constant_time_eq(&expected_hash, &actual_hash) {
             return Err(VeilError::Validation(format!(
                 "audit entry hash mismatch for action '{}'", entry.action
             )));
         }
 
-        recomputed_hashes.push(crypto::to_base64(&expected_hash));
+        prev_verified_raw = expected_hash;
     }
 
-    // Check linkage using verified hashes
-    for (entry, prev_hash) in entries.iter().skip(1).zip(&recomputed_hashes) {
-        if entry.prev_hash != *prev_hash {
-            return Err(VeilError::Validation(
-                "audit chain broken: prev_hash does not match previous entry_hash".into(),
-            ));
-        }
-    }
-
-    // Non-empty is guaranteed by the `first()` check above.
-    recomputed_hashes
-        .last()
-        .cloned()
-        .ok_or_else(|| VeilError::Validation("audit chain is empty".into()))
+    // Non-empty is guaranteed by the is_empty() check above.
+    Ok(crypto::to_base64(&prev_verified_raw))
 }
 
 /// Set `audit_hash` on an envelope to the given entry's `entry_hash`.
