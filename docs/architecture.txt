@@ -43,7 +43,7 @@ NONCE AND SALT HANDLING
     recipient to reconstruct the shared secret.
 
     PBKDF2 salt (identity export): A random 16-byte salt is generated per
-    export and stored in the blob: version(2) || salt(16) || AES-GCM(...).
+    export and stored in the blob: version(1, value=0x02) || salt(16) || AES-GCM(...).
     This ensures that exporting the same identity with the same password
     produces different blobs, and prevents precomputed dictionary attacks.
     The salt is combined with 1,000,000 PBKDF2-HMAC-SHA256 iterations.
@@ -217,10 +217,9 @@ WHAT VEIL PROVIDES
 
     Authenticated encryption
         AES-256-GCM provides both confidentiality and integrity.
-        A fresh random 12-byte nonce is generated for every encryption
-        operation and prepended to the output. Any tampering with
-        ciphertext, nonce, or associated data is detected and causes
-        decryption to fail.
+        Nonce generation details are in NONCE AND SALT HANDLING above.
+        Any tampering with ciphertext, nonce, or associated data is
+        detected and causes decryption to fail.
 
     Sender authentication (Ed25519 signatures)
         Every sealed envelope is signed with the sealer's Ed25519 key.
@@ -241,9 +240,8 @@ WHAT VEIL PROVIDES
 
     Context-bound key derivation
         HKDF info binds both the ephemeral and recipient public keys,
-        preventing cross-context key confusion. The ephemeral public key
-        doubles as the HKDF salt, ensuring a unique extract step per
-        wrapping operation without requiring an additional random field.
+        preventing cross-context key confusion. See NONCE AND SALT
+        HANDLING above for salt details.
 
     Low-order point rejection
         DH outputs are validated via was_contributory() to reject
@@ -275,11 +273,10 @@ WHAT VEIL PROVIDES
 
     Password-based identity export
         PBKDF2-SHA256 (1,000,000 iterations) + AES-256-GCM protects
-        exported identity keys for cross-device recovery. A random
-        16-byte salt is generated per export and stored in the blob,
-        preventing precomputed dictionary attacks. The export blob
-        includes both DH and signing secrets. A minimum password
-        length of 16 characters is enforced.
+        exported identity keys for cross-device recovery. Salt details
+        are in NONCE AND SALT HANDLING above. The export blob includes
+        both DH and signing secrets. A minimum password length of 16
+        characters is enforced.
 
     Server zero-knowledge
         The server never sees plaintext, DEKs, or private keys.
@@ -296,12 +293,10 @@ WHAT VEIL PROVIDES
         if a removed user cached the old DEK, it no longer works.
 
     Streaming chunk authentication
-        Each chunk is encrypted with a unique nonce constructed as
-        random_prefix(8) || chunk_index(4 BE). The random prefix
-        prevents nonce collision across different streams; the counter
-        prevents reuse within a stream. Associated data binds the
-        chunk index and finality flag. Reordering, duplication, or
-        truncation of chunks causes decryption to fail.
+        Each chunk is encrypted with a unique nonce (see NONCE AND
+        SALT HANDLING above for construction). Associated data binds
+        the chunk index and finality flag. Reordering, duplication,
+        or truncation of chunks causes decryption to fail.
 
     Tamper-evident audit trail
         Audit log entries form a SHA-256 hash chain with Ed25519
