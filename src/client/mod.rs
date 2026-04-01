@@ -89,14 +89,19 @@ impl VeilClient {
                 (ik, true)
             };
 
-        http::upload_public_keys(
-            &server_url,
-            user_id,
-            &identity.dh_public,
-            &identity.sign_public,
-            auth_token.as_deref(),
-        )
-        .await?;
+        // Only upload public keys for new identities. Existing identities
+        // were already uploaded on creation; re-upload on every init wastes
+        // a network round-trip. Use rotateKey() to push new keys.
+        if is_new {
+            http::upload_public_keys(
+                &server_url,
+                user_id,
+                &identity.dh_public,
+                &identity.sign_public,
+                auth_token.as_deref(),
+            )
+            .await?;
+        }
 
         Ok(Self {
             user_id: user_id.to_string(),
@@ -338,6 +343,23 @@ impl VeilClient {
         Ok(())
     }
 
+    /// Parse a JS JSON value into a verified `GroupKeyBundle`.
+    async fn parse_and_verify_bundle(
+        &self,
+        json_value: &JsValue,
+    ) -> Result<GroupKeyBundle, VeilError> {
+        let json_str = js_sys::JSON::stringify(json_value)
+            .map_err(|e| http::js_err("JSON.stringify", &e))?
+            .as_string()
+            .ok_or_else(|| VeilError::Encoding("JSON.stringify returned non-string".into()))?;
+
+        let bundle: GroupKeyBundle = serde_json::from_str(&json_str)
+            .map_err(|e| VeilError::Encoding(format!("parse group bundle: {e}")))?;
+
+        self.verify_and_accept_bundle(&bundle).await?;
+        Ok(bundle)
+    }
+
     /// Fetch a group bundle from the server and verify its signature.
     async fn fetch_group_bundle(
         &self,
@@ -349,18 +371,7 @@ impl VeilClient {
             http::encode_user_id(group_id),
         );
         let json_value = http::fetch_get_json(&url, self.auth_token.as_deref()).await?;
-
-        let json_str = js_sys::JSON::stringify(&json_value)
-            .map_err(|e| http::js_err("JSON.stringify", &e))?
-            .as_string()
-            .ok_or_else(|| VeilError::Encoding("JSON.stringify returned non-string".into()))?;
-
-        let bundle: GroupKeyBundle = serde_json::from_str(&json_str)
-            .map_err(|e| VeilError::Encoding(format!("parse group bundle: {e}")))?;
-
-        self.verify_and_accept_bundle(&bundle).await?;
-
-        Ok(bundle)
+        self.parse_and_verify_bundle(&json_value).await
     }
 
     /// Try to fetch a group bundle; returns `None` on 404 (group not found).
@@ -375,19 +386,7 @@ impl VeilClient {
         );
 
         match http::try_fetch_get_json(&url, self.auth_token.as_deref()).await? {
-            Some(json_value) => {
-                let json_str = js_sys::JSON::stringify(&json_value)
-                    .map_err(|e| http::js_err("JSON.stringify", &e))?
-                    .as_string()
-                    .ok_or_else(|| VeilError::Encoding("JSON.stringify returned non-string".into()))?;
-
-                let bundle: GroupKeyBundle = serde_json::from_str(&json_str)
-                    .map_err(|e| VeilError::Encoding(format!("parse group bundle: {e}")))?;
-
-                self.verify_and_accept_bundle(&bundle).await?;
-
-                Ok(Some(bundle))
-            }
+            Some(json_value) => self.parse_and_verify_bundle(&json_value).await.map(Some),
             None => Ok(None),
         }
     }

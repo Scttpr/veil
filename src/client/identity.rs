@@ -103,8 +103,7 @@ fn export_identity_blob(
     }
 
     let mut salt = [0u8; EXPORT_SALT_LEN];
-    getrandom::getrandom(&mut salt)
-        .map_err(|e| VeilError::Crypto(format!("rng: {e}")))?;
+    crypto::random_bytes(&mut salt)?;
 
     let wrapping_key = derive_export_key(password, &salt);
 
