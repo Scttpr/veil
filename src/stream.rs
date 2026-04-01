@@ -1,23 +1,16 @@
+use aes_gcm::aead::{Aead as _, Payload};
+use aes_gcm::{Aes256Gcm, KeyInit as _, Nonce};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::constants::{self, DOMAIN_STREAM_V1};
 use crate::crypto::{self, VeilError};
-use crate::envelope::{self, WrappedKey};
+use crate::envelope::{self, EnvelopeAccess, WrappedKey};
 
 const DEFAULT_CHUNK_SIZE: u32 = 64 * 1024; // 64 KiB
 const NONCE_PREFIX_LEN: usize = 8;
 // Compile-time assertion: nonce_prefix (8) + chunk_index (4) must equal AES-GCM nonce (12).
 const _: () = assert!(NONCE_PREFIX_LEN + 4 == 12);
-
-/// Discriminates between direct (per-recipient) and group stream access.
-#[derive(Clone)]
-pub enum StreamAccess {
-    /// Per-recipient ECIES-wrapped DEK.
-    Direct { recipients: Vec<WrappedKey> },
-    /// Group stream: DEK wrapped with the GEK.
-    Group { group_id: String, wrapped_dek: String },
-}
 
 /// Stream header: DEK access control, stream metadata, and signature.
 #[derive(Clone)]
@@ -25,7 +18,7 @@ pub struct StreamHeader {
     pub version: u8,
     pub chunk_size: u32,
     pub nonce_prefix: String,
-    pub access: StreamAccess,
+    pub access: EnvelopeAccess,
     pub metadata: Option<serde_json::Value>,
     pub signer_id: Option<String>,
     pub signature: Option<String>,
@@ -66,6 +59,13 @@ impl TryFrom<StreamHeaderWire> for StreamHeader {
         if w.chunk_size == 0 {
             return Err(VeilError::Validation("chunk_size must be > 0".into()));
         }
+        if w.recipients.len() > constants::MAX_RECIPIENTS {
+            return Err(VeilError::Validation(format!(
+                "too many recipients: {} (max {})",
+                w.recipients.len(),
+                constants::MAX_RECIPIENTS
+            )));
+        }
         {
             let mut seen = std::collections::HashSet::with_capacity(w.recipients.len());
             for r in &w.recipients {
@@ -84,9 +84,9 @@ impl TryFrom<StreamHeaderWire> for StreamHeader {
                         "group stream header must not have recipients".into(),
                     ));
                 }
-                StreamAccess::Group { group_id, wrapped_dek }
+                EnvelopeAccess::Group { group_id, wrapped_dek }
             }
-            (None, None) => StreamAccess::Direct { recipients: w.recipients },
+            (None, None) => EnvelopeAccess::Direct { recipients: w.recipients },
             _ => {
                 return Err(VeilError::Format(
                     "group_id and wrapped_dek must both be present or both absent".into(),
@@ -109,8 +109,8 @@ impl TryFrom<StreamHeaderWire> for StreamHeader {
 impl From<StreamHeader> for StreamHeaderWire {
     fn from(h: StreamHeader) -> Self {
         let (recipients, group_id, wrapped_dek) = match h.access {
-            StreamAccess::Direct { recipients } => (recipients, None, None),
-            StreamAccess::Group { group_id, wrapped_dek } => {
+            EnvelopeAccess::Direct { recipients } => (recipients, None, None),
+            EnvelopeAccess::Group { group_id, wrapped_dek } => {
                 (Vec::new(), Some(group_id), Some(wrapped_dek))
             }
         };
@@ -143,43 +143,29 @@ impl<'de> Deserialize<'de> for StreamHeader {
     }
 }
 
-// ---------- Convenience methods ----------
+// ---------- Convenience delegates ----------
 
 impl StreamHeader {
-    /// Whether this is a group stream.
     pub const fn is_group(&self) -> bool {
-        matches!(self.access, StreamAccess::Group { .. })
+        self.access.is_group()
     }
 
-    /// The group ID, if this is a group stream.
     pub fn group_id(&self) -> Option<&str> {
-        match &self.access {
-            StreamAccess::Group { group_id, .. } => Some(group_id),
-            StreamAccess::Direct { .. } => None,
-        }
+        self.access.group_id()
     }
 
-    /// The per-recipient wrapped keys. Empty for group streams.
     pub fn recipients(&self) -> &[WrappedKey] {
-        match &self.access {
-            StreamAccess::Direct { recipients } => recipients,
-            StreamAccess::Group { .. } => &[],
-        }
+        self.access.recipients()
     }
 
-    /// The `(group_id, wrapped_dek)` pair, if this is a group stream.
     pub fn group_info(&self) -> Option<(&str, &str)> {
-        match &self.access {
-            StreamAccess::Group { group_id, wrapped_dek } => {
-                Some((group_id, wrapped_dek))
-            }
-            StreamAccess::Direct { .. } => None,
-        }
+        self.access.group_info()
     }
 }
 
 /// Streaming sealer state. Encrypts chunks one at a time.
 pub struct SealerState {
+    cipher: Aes256Gcm,
     dek: Zeroizing<[u8; 32]>,
     nonce_prefix: [u8; NONCE_PREFIX_LEN],
     chunk_index: u32,
@@ -189,6 +175,7 @@ pub struct SealerState {
 
 /// Streaming opener state. Decrypts chunks one at a time.
 pub struct OpenerState {
+    cipher: Aes256Gcm,
     dek: Zeroizing<[u8; 32]>,
     nonce_prefix: [u8; NONCE_PREFIX_LEN],
     chunk_index: u32,
@@ -204,18 +191,21 @@ fn build_nonce(prefix: [u8; NONCE_PREFIX_LEN], chunk_index: u32) -> [u8; 12] {
     nonce
 }
 
-fn build_ad(chunk_index: u32, is_final: bool) -> Vec<u8> {
-    let mut ad = Vec::with_capacity(16);
-    ad.extend_from_slice(constants::DOMAIN_STREAM_CHUNK);
-    ad.extend_from_slice(&chunk_index.to_be_bytes());
-    ad.push(u8::from(is_final));
+fn build_ad(chunk_index: u32, is_final: bool) -> [u8; 16] {
+    let mut ad = [0u8; 16];
+    ad[..11].copy_from_slice(constants::DOMAIN_STREAM_CHUNK);
+    ad[11..15].copy_from_slice(&chunk_index.to_be_bytes());
+    ad[15] = u8::from(is_final);
     ad
 }
 
 // ---------- Header signature ----------
 
 /// Deterministic payload for header signing.
-fn header_payload(header: &StreamHeader) -> Result<Vec<u8>, VeilError> {
+fn header_payload(
+    header: &StreamHeader,
+    cached_metadata: Option<&[u8]>,
+) -> Result<Vec<u8>, VeilError> {
     let mut payload = Vec::new();
     payload.extend_from_slice(DOMAIN_STREAM_V1);
     payload.push(header.version);
@@ -235,39 +225,8 @@ fn header_payload(header: &StreamHeader) -> Result<Vec<u8>, VeilError> {
     } else {
         payload.push(0);
     }
-    if let Some(ref meta) = header.metadata {
-        payload.push(1);
-        let meta_bytes = serde_json::to_vec(meta)
-            .map_err(|e| VeilError::Encoding(format!("metadata serialize: {e}")))?;
-        let meta_len: u32 = meta_bytes.len()
-            .try_into()
-            .map_err(|_| VeilError::Format("metadata too long".into()))?;
-        payload.extend_from_slice(&meta_len.to_be_bytes());
-        payload.extend_from_slice(&meta_bytes);
-    } else {
-        payload.push(0);
-    }
-    match &header.access {
-        StreamAccess::Group { group_id, wrapped_dek } => {
-            payload.push(1);
-            let gid_bytes = group_id.as_bytes();
-            let gid_len: u32 = gid_bytes.len()
-                .try_into()
-                .map_err(|_| VeilError::Format("group_id too long".into()))?;
-            payload.extend_from_slice(&gid_len.to_be_bytes());
-            payload.extend_from_slice(gid_bytes);
-            let wd_bytes = wrapped_dek.as_bytes();
-            let wd_len: u32 = wd_bytes.len()
-                .try_into()
-                .map_err(|_| VeilError::Format("wrapped_dek too long".into()))?;
-            payload.extend_from_slice(&wd_len.to_be_bytes());
-            payload.extend_from_slice(wd_bytes);
-        }
-        StreamAccess::Direct { recipients } => {
-            payload.push(0);
-            envelope::append_recipients_to_payload(&mut payload, recipients)?;
-        }
-    }
+    envelope::append_metadata_to_payload(&mut payload, &header.metadata, cached_metadata)?;
+    envelope::append_access_to_payload(&mut payload, &header.access)?;
     Ok(payload)
 }
 
@@ -290,7 +249,7 @@ pub fn verify_header(
         .try_into()
         .map_err(|_| VeilError::Format("signature is not 64 bytes".into()))?;
 
-    let payload = header_payload(header)?;
+    let payload = header_payload(header, None)?;
     crypto::ed25519_verify(signer_public, &payload, &sig_bytes)
 }
 
@@ -314,8 +273,7 @@ pub fn create_sealer(
 ) -> Result<SealerState, VeilError> {
     let dek = crypto::generate_random_key()?;
     let mut nonce_prefix = [0u8; NONCE_PREFIX_LEN];
-    getrandom::getrandom(&mut nonce_prefix)
-        .map_err(|e| VeilError::Crypto(format!("rng: {e}")))?;
+    crypto::random_bytes(&mut nonce_prefix)?;
 
     constants::validate_id(our_id, "sealer user_id")?;
     for (id, _) in recipient_keys {
@@ -328,7 +286,7 @@ pub fn create_sealer(
             constants::MAX_RECIPIENTS
         )));
     }
-    constants::validate_metadata(metadata.as_ref())?;
+    let meta_bytes = constants::validate_metadata(metadata.as_ref())?;
 
     if recipient_keys.iter().any(|(id, _)| *id == our_id) {
         return Err(VeilError::Validation("sealer already in recipient list".into()));
@@ -357,17 +315,21 @@ pub fn create_sealer(
         version: 1,
         chunk_size,
         nonce_prefix: crypto::to_base64(&nonce_prefix),
-        access: StreamAccess::Direct { recipients },
+        access: EnvelopeAccess::Direct { recipients },
         metadata,
         signer_id: Some(our_id.to_string()),
         signature: None,
     };
 
-    let payload = header_payload(&header)?;
+    let payload = header_payload(&header, meta_bytes.as_deref())?;
     let sig = crypto::ed25519_sign(sign_secret, &payload);
     header.signature = Some(crypto::to_base64(&sig));
 
+    let cipher = Aes256Gcm::new_from_slice(&*dek)
+        .map_err(|e| VeilError::Crypto(format!("cipher init: {e}")))?;
+
     Ok(SealerState {
+        cipher,
         dek,
         nonce_prefix,
         chunk_index: 0,
@@ -389,11 +351,10 @@ pub fn create_group_sealer(
     metadata: Option<serde_json::Value>,
     chunk_size: Option<u32>,
 ) -> Result<SealerState, VeilError> {
-    constants::validate_metadata(metadata.as_ref())?;
+    let meta_bytes = constants::validate_metadata(metadata.as_ref())?;
     let dek = crypto::generate_random_key()?;
     let mut nonce_prefix = [0u8; NONCE_PREFIX_LEN];
-    getrandom::getrandom(&mut nonce_prefix)
-        .map_err(|e| VeilError::Crypto(format!("rng: {e}")))?;
+    crypto::random_bytes(&mut nonce_prefix)?;
 
     let chunk_size = chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE);
     if chunk_size == 0 {
@@ -401,16 +362,14 @@ pub fn create_group_sealer(
     }
 
     // Wrap DEK with GEK
-    let mut ad = Vec::with_capacity(15_usize.saturating_add(group_id.len()));
-    ad.extend_from_slice(constants::DOMAIN_GROUP_DEK);
-    ad.extend_from_slice(group_id.as_bytes());
+    let ad = constants::group_dek_ad(group_id);
     let wrapped = crypto::aead_encrypt(gek, &*dek, &ad)?;
 
     let mut header = StreamHeader {
         version: 1,
         chunk_size,
         nonce_prefix: crypto::to_base64(&nonce_prefix),
-        access: StreamAccess::Group {
+        access: EnvelopeAccess::Group {
             group_id: group_id.to_string(),
             wrapped_dek: crypto::to_base64(&wrapped),
         },
@@ -419,11 +378,15 @@ pub fn create_group_sealer(
         signature: None,
     };
 
-    let payload = header_payload(&header)?;
+    let payload = header_payload(&header, meta_bytes.as_deref())?;
     let sig = crypto::ed25519_sign(sign_secret, &payload);
     header.signature = Some(crypto::to_base64(&sig));
 
+    let cipher = Aes256Gcm::new_from_slice(&*dek)
+        .map_err(|e| VeilError::Crypto(format!("cipher init: {e}")))?;
+
     Ok(SealerState {
+        cipher,
         dek,
         nonce_prefix,
         chunk_index: 0,
@@ -454,10 +417,13 @@ impl SealerState {
             return Err(VeilError::Validation("stream already finalized".into()));
         }
 
-        let nonce = build_nonce(self.nonce_prefix, self.chunk_index);
+        let nonce_bytes = build_nonce(self.nonce_prefix, self.chunk_index);
         let ad = build_ad(self.chunk_index, is_last);
 
-        let ct = crypto::aead_encrypt_with_nonce(&self.dek, &nonce, plaintext, &ad)?;
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let payload = Payload { msg: plaintext, aad: &ad };
+        let ct = self.cipher.encrypt(nonce, payload)
+            .map_err(|e| VeilError::Crypto(format!("encrypt: {e}")))?;
 
         self.chunk_index = self.chunk_index
             .checked_add(1)
@@ -491,7 +457,11 @@ pub fn create_opener(
         .try_into()
         .map_err(|_| VeilError::Crypto("nonce_prefix not 8 bytes".into()))?;
 
+    let cipher = Aes256Gcm::new_from_slice(&*dek)
+        .map_err(|e| VeilError::Crypto(format!("cipher init: {e}")))?;
+
     Ok(OpenerState {
+        cipher,
         dek,
         nonce_prefix,
         chunk_index: 0,
@@ -522,10 +492,14 @@ impl OpenerState {
 
         let is_final = flag != 0;
 
-        let nonce = build_nonce(self.nonce_prefix, self.chunk_index);
+        let nonce_bytes = build_nonce(self.nonce_prefix, self.chunk_index);
         let ad = build_ad(self.chunk_index, is_final);
 
-        let decrypted = crypto::aead_decrypt_with_nonce(&self.dek, &nonce, ct, &ad)?;
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let payload = Payload { msg: ct, aad: &ad };
+        let decrypted = self.cipher.decrypt(nonce, payload)
+            .map(Zeroizing::new)
+            .map_err(|_| VeilError::Crypto("decrypt failed: wrong key or corrupted data".into()))?;
 
         self.chunk_index = self.chunk_index
             .checked_add(1)
@@ -556,8 +530,8 @@ pub fn unwrap_stream_dek(
     our_public: &[u8; 32],
 ) -> Result<Zeroizing<[u8; 32]>, VeilError> {
     let recipients = match &header.access {
-        StreamAccess::Direct { recipients } => recipients,
-        StreamAccess::Group { .. } => {
+        EnvelopeAccess::Direct { recipients } => recipients,
+        EnvelopeAccess::Group { .. } => {
             return Err(VeilError::Validation("not a recipient of this stream".into()));
         }
     };
@@ -580,17 +554,14 @@ pub fn unwrap_group_stream_dek(
     gek: &[u8; 32],
 ) -> Result<Zeroizing<[u8; 32]>, VeilError> {
     let (group_id, wrapped_dek_b64) = match &header.access {
-        StreamAccess::Group { group_id, wrapped_dek } => (group_id.as_str(), wrapped_dek.as_str()),
-        StreamAccess::Direct { .. } => {
+        EnvelopeAccess::Group { group_id, wrapped_dek } => (group_id.as_str(), wrapped_dek.as_str()),
+        EnvelopeAccess::Direct { .. } => {
             return Err(VeilError::Encoding("not a group stream".into()));
         }
     };
 
     let wrapped = crypto::from_base64(wrapped_dek_b64)?;
-
-    let mut ad = Vec::with_capacity(15_usize.saturating_add(group_id.len()));
-    ad.extend_from_slice(constants::DOMAIN_GROUP_DEK);
-    ad.extend_from_slice(group_id.as_bytes());
+    let ad = constants::group_dek_ad(group_id);
 
     let dek_bytes = crypto::aead_decrypt(gek, &wrapped, &ad)?;
     Ok(Zeroizing::new(<[u8; 32]>::try_from(dek_bytes.as_slice())
