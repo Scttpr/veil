@@ -110,7 +110,7 @@ pub async fn tofu_verify_and_pin(user_id: &str, bundle: &PublicKeyBundle) -> Res
     let existing = storage::load_combined_key_pin(user_id).await?;
 
     if let Some((pinned_dh, pinned_sign)) = existing {
-        if pinned_dh != bundle.dh_public {
+        if !crypto::constant_time_eq(&pinned_dh, &bundle.dh_public) {
             return Err(VeilError::Tofu(format!(
                 "public key for '{user_id}' has changed (possible MITM). \
                  Pinned:   {} \
@@ -121,7 +121,7 @@ pub async fn tofu_verify_and_pin(user_id: &str, bundle: &PublicKeyBundle) -> Res
             )));
         }
 
-        if pinned_sign != bundle.sign_public {
+        if !crypto::constant_time_eq(&pinned_sign, &bundle.sign_public) {
             return Err(VeilError::Tofu(format!(
                 "signing key for '{user_id}' has changed (possible MITM). \
                  Pinned:   {} \
