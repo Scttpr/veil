@@ -511,12 +511,8 @@ pub fn verify_bundle(
             constants::MAX_GROUP_MEMBERS
         )));
     }
-    if !bundle.members.iter().any(|m| m.user_id == bundle.signer_id) {
-        return Err(VeilError::Encoding(format!(
-            "bundle signer '{}' is not a member of the group",
-            bundle.signer_id
-        )));
-    }
+    // Note: signer-is-member is already enforced during deserialization
+    // (TryFrom<GroupKeyBundleWire>), so not checked again here.
 
     let sig_bytes: [u8; 64] = crypto::from_base64(&bundle.signature)?
         .try_into()
@@ -542,14 +538,12 @@ pub fn seal(
     sign_secret: &[u8; 32],
     metadata: Option<serde_json::Value>,
 ) -> Result<Envelope, VeilError> {
-    constants::validate_metadata(metadata.as_ref())?;
+    let meta_bytes = constants::validate_metadata(metadata.as_ref())?;
     let dek = crypto::generate_random_key()?;
     let ct = crypto::aead_encrypt(&dek, plaintext, DOMAIN_DATA)?;
 
     // Wrap DEK with GEK using AES-GCM (AD = "veil-group-dek:" || group_id)
-    let mut ad = Vec::with_capacity(15_usize.saturating_add(group_id.len()));
-    ad.extend_from_slice(constants::DOMAIN_GROUP_DEK);
-    ad.extend_from_slice(group_id.as_bytes());
+    let ad = constants::group_dek_ad(group_id);
     let wrapped = crypto::aead_encrypt(gek, &*dek, &ad)?;
 
     let mut envelope = Envelope {
@@ -565,7 +559,7 @@ pub fn seal(
         audit_hash: None,
     };
 
-    let payload = envelope::signature_payload(&envelope)?;
+    let payload = envelope::signature_payload(&envelope, meta_bytes.as_deref())?;
     let sig = crypto::ed25519_sign(sign_secret, &payload);
     envelope.signature = Some(crypto::to_base64(&sig));
 
@@ -598,10 +592,7 @@ pub fn open(
     };
 
     let wrapped = crypto::from_base64(wrapped_dek_b64)?;
-
-    let mut ad = Vec::with_capacity(15_usize.saturating_add(group_id.len()));
-    ad.extend_from_slice(constants::DOMAIN_GROUP_DEK);
-    ad.extend_from_slice(group_id.as_bytes());
+    let ad = constants::group_dek_ad(group_id);
 
     let dek_bytes = crypto::aead_decrypt(gek, &wrapped, &ad)?;
     let dek = Zeroizing::new(<[u8; 32]>::try_from(dek_bytes.as_slice())
