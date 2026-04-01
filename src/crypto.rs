@@ -5,10 +5,18 @@ use ed25519_dalek::{Signer, Verifier};
 use hkdf::Hkdf;
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
+use subtle::ConstantTimeEq as _;
 use zeroize::{Zeroize, Zeroizing};
 
 const IV_BYTES: usize = 12;
 pub(crate) const TAG_BYTES: usize = 16;
+
+/// Constant-time comparison of two byte slices.
+/// Returns `true` if they are equal without leaking timing information
+/// about which bytes differ.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.ct_eq(b).into()
+}
 
 // ---------- Error type ----------
 
@@ -75,8 +83,7 @@ impl VeilError {
 /// Returns `VeilError` if the system RNG fails.
 pub fn generate_key_pair() -> Result<(Zeroizing<[u8; 32]>, [u8; 32]), VeilError> {
     let mut secret_bytes = Zeroizing::new([0u8; 32]);
-    getrandom::getrandom(&mut *secret_bytes)
-        .map_err(|e| VeilError::Crypto(format!("rng: {e}")))?;
+    random_bytes(&mut *secret_bytes)?;
     let secret = StaticSecret::from(*secret_bytes);
     let public = PublicKey::from(&secret);
     Ok((Zeroizing::new(secret.to_bytes()), public.to_bytes()))
@@ -135,6 +142,15 @@ pub fn hkdf_sha256(
     Ok(Zeroizing::new(okm))
 }
 
+/// Fill a buffer with cryptographically secure random bytes.
+///
+/// # Errors
+///
+/// Returns `VeilError` if the system RNG fails.
+pub fn random_bytes(buf: &mut [u8]) -> Result<(), VeilError> {
+    getrandom::getrandom(buf).map_err(|e| VeilError::Crypto(format!("rng: {e}")))
+}
+
 /// Generate a random 32-byte key (for use as a DEK).
 ///
 /// # Errors
@@ -142,9 +158,25 @@ pub fn hkdf_sha256(
 /// Returns `VeilError` if the system RNG fails.
 pub fn generate_random_key() -> Result<Zeroizing<[u8; 32]>, VeilError> {
     let mut key = Zeroizing::new([0u8; 32]);
-    getrandom::getrandom(&mut *key)
-        .map_err(|e| VeilError::Crypto(format!("rng: {e}")))?;
+    random_bytes(&mut *key)?;
     Ok(key)
+}
+
+/// Derive a 32-byte key via HKDF-SHA256, returning it as a zeroizing array.
+///
+/// # Errors
+///
+/// Returns `VeilError` if HKDF expansion fails.
+pub fn hkdf_derive_key(
+    ikm: &[u8],
+    salt: Option<&[u8]>,
+    info: &[u8],
+) -> Result<Zeroizing<[u8; 32]>, VeilError> {
+    let hk = Hkdf::<Sha256>::new(salt, ikm);
+    let mut okm = Zeroizing::new([0u8; 32]);
+    hk.expand(info, &mut *okm)
+        .map_err(|e| VeilError::Crypto(format!("hkdf expand: {e}")))?;
+    Ok(okm)
 }
 
 /// Encrypt with AES-256-GCM using a specific key and associated data.
@@ -164,8 +196,7 @@ pub fn aead_encrypt(
         .map_err(|e| VeilError::Crypto(format!("cipher init: {e}")))?;
 
     let mut nonce_bytes = [0u8; IV_BYTES];
-    getrandom::getrandom(&mut nonce_bytes)
-        .map_err(|e| VeilError::Crypto(format!("rng: {e}")))?;
+    random_bytes(&mut nonce_bytes)?;
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let payload = Payload { msg: plaintext, aad: ad };
@@ -271,8 +302,7 @@ pub(crate) fn aead_decrypt_with_nonce(
 /// Returns `VeilError` if the system RNG fails.
 pub fn generate_signing_key_pair() -> Result<(Zeroizing<[u8; 32]>, [u8; 32]), VeilError> {
     let mut secret_bytes = Zeroizing::new([0u8; 32]);
-    getrandom::getrandom(&mut *secret_bytes)
-        .map_err(|e| VeilError::Crypto(format!("rng: {e}")))?;
+    random_bytes(&mut *secret_bytes)?;
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret_bytes);
     let verifying_key = signing_key.verifying_key();
     Ok((Zeroizing::new(signing_key.to_bytes()), verifying_key.to_bytes()))
